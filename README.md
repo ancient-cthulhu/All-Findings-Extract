@@ -62,7 +62,7 @@ python script.py --app-name "MyApp"
 
 **Multiple applications (comma-separated):**
 ```bash
-python script.py --app-name "Org/Repo"
+python script.py --app-name "Org/Repo, MyApp"
 ```
 
 **By GUID:**
