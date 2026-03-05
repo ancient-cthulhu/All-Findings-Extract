@@ -176,48 +176,72 @@ def parse_args():
 
 
 def get_applications(session, sleep_time=0.5, rate_limiter=None):
-    """Fetch all applications using pagination."""
+    """Fetch all applications using pagination. Uses small delay between pages for stability."""
     print("\n" + "=" * 70)
     print("  FETCHING APPLICATIONS")
     print("=" * 70)
 
     all_apps = []
     page = 0
+    consecutive_errors = 0
+    max_consecutive_errors = 3
 
     while True:
-        print(f"  Fetching applications page {page}...")
+        if page == 0:
+            print(f"  Fetching applications...")
         
-        if rate_limiter:
-            rate_limiter.acquire()
-        
-        resp = session.get(
-            APPLICATIONS_URL,
-            params={"page": page, "size": 1000},  # Increased from 500
-            auth=RequestsAuthPluginVeracodeHMAC(),
-            timeout=60,
-        )
+        try:
+            # Small delay between pages to avoid overwhelming API
+            if page > 0:
+                time.sleep(0.1)
+            
+            resp = session.get(
+                APPLICATIONS_URL,
+                params={"page": page, "size": 1000},
+                auth=RequestsAuthPluginVeracodeHMAC(),
+                timeout=45,  # Reduced from 60 for faster failure detection
+            )
 
-        if resp.status_code != 200:
-            print(f"  ERROR: Status {resp.status_code}")
-            print(f"  Response: {resp.text}")
-            resp.raise_for_status()
+            if resp.status_code != 200:
+                print(f"  WARNING: Status {resp.status_code} on page {page}, retrying...")
+                consecutive_errors += 1
+                if consecutive_errors >= max_consecutive_errors:
+                    print(f"  ERROR: Too many consecutive errors, stopping at {len(all_apps)} applications")
+                    break
+                time.sleep(1)  # Wait before retry
+                continue
 
-        data = resp.json()
-        applications = data.get("_embedded", {}).get("applications", [])
+            consecutive_errors = 0  # Reset error counter on success
+            
+            data = resp.json()
+            applications = data.get("_embedded", {}).get("applications", [])
 
-        if not applications:
+            if not applications:
+                break
+
+            all_apps.extend(applications)
+            
+            if page == 0 or (page + 1) % 5 == 0:  # Show progress every 5 pages
+                print(f"  Retrieved {len(all_apps)} applications so far...")
+
+            if not data.get("_links", {}).get("next"):
+                break
+
+            page += 1
+            
+        except KeyboardInterrupt:
+            print(f"\n  Interrupted by user. Retrieved {len(all_apps)} applications so far.")
             break
+        except Exception as e:
+            print(f"  WARNING: Error on page {page}: {str(e)[:100]}")
+            consecutive_errors += 1
+            if consecutive_errors >= max_consecutive_errors:
+                print(f"  ERROR: Too many consecutive errors, stopping at {len(all_apps)} applications")
+                break
+            time.sleep(1)  # Wait before retry
+            continue
 
-        all_apps.extend(applications)
-        print(f"  Page {page}: {len(applications)} applications (Total: {len(all_apps)})")
-
-        if not data.get("_links", {}).get("next"):
-            break
-
-        page += 1
-        # Sleep removed - rate limiter handles this
-
-    print(f"\n  Total applications found: {len(all_apps)}\n")
+    print(f"\n  ✓ Total applications found: {len(all_apps)}\n")
     return all_apps
 
 
@@ -744,8 +768,6 @@ def generate_veracode_link(app_guid, scan_type, finding_details, sandbox_guid=No
                 
                 if workspace_guid and project_id:
                     return f"https://sca.analysiscenter.veracode.com/workspaces/{workspace_guid}/projects/{project_id}/issues"
-                elif workspace_guid:
-                    return f"https://sca.analysiscenter.veracode.com/workspaces/{workspace_guid}"
                 else:
                     return "https://sca.analysiscenter.veracode.com/workspaces"
             
@@ -930,40 +952,66 @@ def normalize_detailed_iac_finding(finding, iac_record, app_name, app_guid, app_
     severity_str = finding.get('severity', 'unknown').lower()
     severity_level, severity_name = iac_severity_map.get(severity_str, (0, "Informational"))
     
-    title = finding.get('title', 'IaC Misconfiguration')
+    # Extract IAC-specific fields
+    finding_id = finding.get('id', '')  # Finding ID (e.g., CVE, GHSA)
+    finding_type = finding.get('finding_type', '')  # Finding Type (e.g., vulnerability, misconfiguration)
+    title = finding.get('title', '') or finding.get('description', 'IaC Misconfiguration')
     description = finding.get('description', '')
-    rule_id = finding.get('rule_id', '')
-    file_path = finding.get('file_path', '')
-    line_number = finding.get('line_number', '')
+    rule_id = finding.get('rule_id', '')  # Policy/Rule ID
+    
+    # File Path - can be string or list
+    file_path_raw = finding.get('filepath', [])
+    if isinstance(file_path_raw, list):
+        file_path = file_path_raw[0] if file_path_raw else ''
+    else:
+        file_path = file_path_raw or ''
+    
+    # Line numbers
+    start_line = finding.get('start_line', '')
+    end_line = finding.get('end_line', '')
+    
+    # Suggested Fix
+    suggested_fix = finding.get('suggested_fix', '')
+    
+    # CVSS Score
+    cvss = finding.get('cvss', '')
     
     title = strip_html_tags(title)
     description = strip_html_tags(description)
+    suggested_fix = strip_html_tags(suggested_fix)
     
-    full_description = title
-    if description:
-        full_description += f" - {description}"
-    if rule_id:
-        full_description += f" [Rule: {rule_id}]"
+    # Build comprehensive description - include finding ID if available
+    full_description = description or title
+    if finding_id:
+        full_description = f"{finding_id}: {full_description}"
     
+    # Vulnerability Title = Finding Type (e.g., "vulnerability", "misconfiguration")
+    vulnerability_title = finding_type.title() if finding_type else None
+    
+    # Build location string with line numbers
     location = file_path
-    if line_number:
-        location += f":{line_number}"
+    if start_line and end_line:
+        location += f" (Lines {start_line}-{end_line})"
+    elif start_line:
+        location += f" (Line {start_line})"
     
     scan_date = iac_record.get('scanned_at')
-    
     scan_id = iac_record.get('scan_id', '')
     scan_url = f"https://web.analysiscenter.veracode.com/app/container-iac-scans/{scan_id}/summary" if scan_id else None
+    
+    # Use Finding ID as flaw name if available, otherwise use title
+    flaw_name = finding_id if finding_id else title
     
     return {
         "Application Name": app_name,
         "Application ID": app_guid,
         "Sandbox Name": None,
         "Custom Severity Name": severity_name,
-        "CVE ID": None,
+        "CVE ID": finding_id if finding_type == "vulnerability" else None,  # Use Finding ID as CVE for vulnerabilities
         "Description": full_description,
-        "Vulnerability Title": None,
-        "CWE ID": rule_id if rule_id else None,
-        "Flaw Name": title,
+        "Vulnerability Title": vulnerability_title,  # Finding Type goes here (e.g., "Vulnerability", "Misconfiguration")
+        "CWE ID": rule_id if rule_id else None,  # Use Rule ID as CWE
+        "Flaw Name": flaw_name,
         "First Found Date": scan_date,
         "Filename/Class": location if location else None,
         "Finding Status": "OPEN",
@@ -971,11 +1019,17 @@ def normalize_detailed_iac_finding(finding, iac_record, app_name, app_guid, app_
         "Team Name": team_name,
         "Days to Resolve": None,
         "Scan Type": "IAC",
-        "CVSS": None,
+        "CVSS": cvss if cvss else None,
         "Severity": severity_level,
         "Resolution Status": None,
         "Resolution": None,
         "Veracode Link": scan_url,
+        "Mitigation Comments": suggested_fix if suggested_fix else None,  # Suggested Fix goes here
+        
+        # Keep only essential IAC-specific fields that don't have good standard equivalents
+        "IAC File Path": file_path,
+        "IAC Start Line": start_line if start_line else None,
+        "IAC End Line": end_line if end_line else None,
     }
 
 
@@ -1242,6 +1296,9 @@ def main():
                     "profile": app_profile
                 }
             
+            print(f"  DEBUG: Created app_map with {len(app_map)} applications")
+            print(f"  DEBUG: Sample app names in map: {list(app_map.keys())[:5]}")
+            
             iac_findings_count = 0
             iac_apps_processed = 0
             
@@ -1257,41 +1314,49 @@ def main():
                     asset_name_lower = asset_name.lower()
                     asset_name_normalized = asset_name_lower.replace('/', '').replace('-', '').replace('_', '').replace(' ', '')
                     
-                    if len(asset_name_normalized) < 3:
-                        continue
-                    
-                    for app_name in app_map.keys():
-                        app_name_lower = app_name.lower()
-                        app_name_normalized = app_name_lower.replace('-', '').replace('_', '').replace(' ', '')
-                        
-                        if len(app_name_normalized) < 3:
-                            continue
-                        
-                        if app_name_lower in asset_name_lower:
-                            matched_app = app_name
-                            break
-                        elif asset_name_lower in app_name_lower:
-                            matched_app = app_name
-                            break
-                        elif app_name_normalized and app_name_normalized in asset_name_normalized:
-                            matched_app = app_name
-                            break
-                        elif asset_name_normalized and asset_name_normalized in app_name_normalized:
-                            matched_app = app_name
-                            break
+                    if len(asset_name_normalized) >= 3:
+                        for app_name in app_map.keys():
+                            app_name_lower = app_name.lower()
+                            app_name_normalized = app_name_lower.replace('-', '').replace('_', '').replace(' ', '')
+                            
+                            if len(app_name_normalized) < 3:
+                                continue
+                            
+                            if app_name_lower in asset_name_lower:
+                                matched_app = app_name
+                                break
+                            elif asset_name_lower in app_name_lower:
+                                matched_app = app_name
+                                break
+                            elif app_name_normalized and app_name_normalized in asset_name_normalized:
+                                matched_app = app_name
+                                break
+                            elif asset_name_normalized and asset_name_normalized in app_name_normalized:
+                                matched_app = app_name
+                                break
                 
+                # If no match found, create placeholder entry for this IAC asset
                 if not matched_app:
-                    print(f"  ⚠️  Skipping IaC asset '{asset_name}' - no matching application found")
-                    continue
+                    iac_scan_id = iac_record.get('scan_id', asset_name)  # Use scan_id if available
+                    print(f"  ⚠️  No matching application found for IaC asset '{asset_name}' - including with placeholder profile")
+                    app_info = {
+                        "guid": str(iac_scan_id),  # Use IAC scan ID as GUID
+                        "profile": {
+                            "name": asset_name,
+                            "business_unit": {"name": "Unknown"},
+                            "teams": []
+                        }
+                    }
+                    matched_app_name = asset_name
+                else:
+                    app_info = app_map[matched_app]
+                    matched_app_name = matched_app
                 
                 iac_apps_processed += 1
-                app_info = app_map[matched_app]
                 detailed_findings = iac_record.get('detailed_findings', [])
                 
-                matched_app_name = matched_app
-                
                 if detailed_findings:
-                    if matched_app_name != asset_name:
+                    if matched_app and matched_app_name != asset_name:
                         print(f"  Processing IaC asset '{asset_name}' → matched to app '{matched_app_name}': {len(detailed_findings)} findings")
                     else:
                         print(f"  Processing {asset_name}: {len(detailed_findings)} findings")
@@ -1325,12 +1390,18 @@ def main():
     if all_findings:
         # Normalize findings - but skip those already normalized (IaC findings)
         normalized_findings = []
+        iac_in_list = 0
         for f in all_findings:
             # Check if already normalized (has "Application Name" key instead of "_app_name")
             if "Application Name" in f:
                 normalized_findings.append(f)
+                if f.get("Scan Type") == "IAC":
+                    iac_in_list += 1
             else:
                 normalized_findings.append(normalize_finding(f))
+        
+        print(f"  DEBUG: Total normalized findings: {len(normalized_findings)}")
+        print(f"  DEBUG: IAC findings in list: {iac_in_list}")
 
         fieldnames = [
             "Application Name",
@@ -1355,6 +1426,10 @@ def main():
             "Resolution",
             "Mitigation Comments",
             "Veracode Link",
+            # IAC-specific columns
+            "IAC File Path",
+            "IAC Start Line",
+            "IAC End Line",
         ]
 
         with open(args.output, "w", encoding="utf-8", newline="") as csvfile:
