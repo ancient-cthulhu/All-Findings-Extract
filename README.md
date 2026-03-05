@@ -1,428 +1,193 @@
 # Veracode Findings API Export
 
-A Python script to export vulnerability findings from Veracode using multiple APIs. Iterates through all applications in your Veracode account and retrieves findings for each one, with optional sandbox coverage and IaC (Infrastructure as Code) scan results.
+Export vulnerability findings from Veracode across all scan types (SAST, DAST, SCA, Manual, IaC) into a single CSV file.
 
 ## Prerequisites
 
-### Veracode API Credentials
+### API Credentials
 
-Requires HMAC authentication. Your account must have one of the following:
+Requires one of:
+- **API Service Account** with **Results API** role (recommended for org-wide access)
+- **User Account** with **Reviewer** or **Security Lead** role (limited to assigned teams)
 
-- **API Service Account** with the **Results API** role
-- **User Account** with the **Reviewer** or **Security Lead** role
-
-Create a credentials file at:
-
-- **Windows:** `C:\Users\<username>\.veracode\credentials`
-- **Mac/Linux:** `~/.veracode/credentials`
-
+**Setup:**
 ```ini
+# Windows: C:\Users\<username>\.veracode\credentials
+# Mac/Linux: ~/.veracode/credentials
+
 [default]
 veracode_api_key_id = YOUR_API_KEY_ID
 veracode_api_key_secret = YOUR_API_KEY_SECRET
 ```
 
-Or set environment variables:
-
-```bash
-export VERACODE_API_KEY_ID=your_key_id
-export VERACODE_API_KEY_SECRET=your_key_secret
-```
-
 ### Python Requirements
-
-- Python 3.7+
-- `requests`
-- `veracode-api-signing`
-
 ```bash
 pip install requests veracode-api-signing
 ```
 
-## Usage
+## Features
 
-### Export all findings (policy scans only)
+- **Comprehensive Coverage**: Exports findings from all Veracode scan types:
+  - Static Analysis (SAST)
+  - Dynamic Analysis (DAST) 
+  - Software Composition Analysis (SCA & SCA Agent)
+  - Manual Penetration Testing
+  - Infrastructure as Code (Container Security)
+- **Concurrent Processing**: Parallel API requests with configurable thread pools for fast exports
+- **Rate Limiting**: Built-in token bucket algorithm prevents API throttling
+- **Smart Filtering**: Filter by application, scan type, severity, CWE, status
+- **Sandbox Support**: Optionally include findings from development sandboxes
 
+## Quick Start
+
+**Export all findings:**
 ```bash
 python script.py
 ```
 
-### Include sandbox findings
-
+**Filter by applications:**
 ```bash
-python script.py --include-sandbox
+python script.py --app-name "App1,App2,App3"
 ```
 
-### Filter by application (single or multiple)
-
-**Single application:**
+**Include sandboxes + high severity only:**
 ```bash
-python script.py --app-name "MyApp"
+python script.py --include-sandbox --severity-gte 4 --status OPEN
 ```
 
-**Multiple applications (comma-separated):**
+**With IaC scans:**
 ```bash
-python script.py --app-name "Org/Repo, MyApp"
-```
+# 1. Fetch IaC data (requires browser cookies)
+python fetch_iac_details.py --cookies-file cookies.txt --output iac-findings.json
 
-**By GUID:**
-```bash
-python script.py --app-guid "12345678-1234-1234-1234-123456789abc"
-```
-
-> **Note:** When using `--app-name` with comma-separated values, the script performs **exact name matching** (not substring matching) and automatically filters to only those applications.
-
-### Filter by scan type
-
-```bash
-python script.py --scan-type STATIC
-python script.py --scan-type STATIC,DYNAMIC
-python script.py --scan-type SCA
-```
-
-> **Note:** SCA findings must be requested separately from other scan types. The script handles this automatically. If you include `SCA` in `--scan-type` alongside others, it will run two separate API passes and merge the results.
-
-### Filter by severity
-
-```bash
-python script.py --severity 5
-python script.py --severity-gte 3
-```
-
-### Filter by status
-
-```bash
-python script.py --status OPEN
-python script.py --status CLOSED
-```
-
-### Filter by CWE
-
-```bash
-python script.py --cwe 79
-python script.py --cwe 79,89,22
-```
-
-### Include IaC (Infrastructure as Code) scan results
-
-```bash
-python script.py --iac-json iac-findings.json
-```
-
-**With application filtering:**
-```bash
-python script.py \
-  --app-name "Org/Repo" \
-  --iac-json iac-findings.json
-```
-
-### Combined example
-
-```bash
-python script.py \
-  --app-name "Org/Repo" \
-  --scan-type STATIC \
-  --severity-gte 4 \
-  --status OPEN \
-  --include-sandbox \
-  --iac-json iac-findings.json \
-  --output high_severity_open.csv
+# 2. Export all findings
+python script.py --iac-json iac-findings.json --output complete-findings.csv
 ```
 
 ## Command-Line Arguments
 
-|Argument           |Default                    |Description                                                         |
-|-------------------|---------------------------|--------------------------------------------------------------------|
-|`--output`         |`veracode_findings_api.csv`|Output CSV filename                                                 |
-|`--app-name`       |None                       |Filter by application name (exact match). Supports comma-separated values for multiple apps|
-|`--app-guid`       |None                       |Filter by specific application GUID                                 |
-|`--scan-type`      |None                       |STATIC, DYNAMIC, MANUAL, SCA or comma-separated combination         |
-|`--severity`       |None                       |Exact severity (0–5)                                                |
-|`--severity-gte`   |None                       |Severity greater than or equal to (0–5)                             |
-|`--cwe`            |None                       |CWE ID, single or comma-separated                                   |
-|`--status`         |None                       |`OPEN` or `CLOSED`                                                  |
-|`--include-sandbox`|False                      |Also fetch findings from all development sandboxes                  |
-|`--iac-json`       |None                       |Path to IaC scan results JSON file (see IaC section below)          |
-|`--sleep`          |`0.01`                     |Seconds to sleep between API pages (default: 0.01)                  |
-|`--max-workers`    |`10`                       |Maximum concurrent threads for parallel processing                  |
-|`--rate-limit`     |`10.0`                     |Maximum API requests per second across all threads                  |
-|`--max-apps`       |None                       |Cap number of apps to process (useful for testing)                  |
+|Argument           |Default |Description                                                         |
+|-------------------|--------|--------------------------------------------------------------------|
+|`--output`         |`veracode_findings_api.csv`|Output CSV filename                          |
+|`--app-name`       |None    |Comma-separated application names (exact match)                     |
+|`--app-guid`       |None    |Specific application GUID                                           |
+|`--scan-type`      |None    |STATIC, DYNAMIC, MANUAL, SCA (comma-separated)                      |
+|`--severity`       |None    |Exact severity (0–5)                                                |
+|`--severity-gte`   |None    |Severity >= (0–5)                                                   |
+|`--cwe`            |None    |CWE ID (single or comma-separated)                                  |
+|`--status`         |None    |OPEN or CLOSED                                                      |
+|`--include-sandbox`|False   |Include sandbox findings                                            |
+|`--iac-json`       |None    |Path to IaC findings JSON file                                      |
+|`--max-workers`    |10      |Concurrent threads for parallel processing                          |
+|`--rate-limit`     |10.0    |Max API requests/second                                             |
+|`--max-apps`       |None    |Limit apps processed (testing)                                      |
 
-## Performance & Scalability
+## IaC (Container Security) Integration
 
-The script uses concurrent processing with thread pooling and intelligent rate limiting for optimal performance:
+IaC scans require browser session cookies (not available via standard API).
 
-### Concurrent Processing
-- **`--max-workers`**: Controls the number of concurrent threads (default: 10)
-- Applications are processed in parallel, significantly reducing total runtime
-- Each thread uses its own HTTP session with connection pooling
+### Getting IaC Data
 
-### Rate Limiting
-- **`--rate-limit`**: Maximum API requests per second across all threads (default: 10)
-- Uses token bucket algorithm to prevent API throttling (429 errors)
-- Automatically distributes rate limit across all worker threads
+**Step 1: Extract browser cookies**
+1. Log into Veracode Platform (https://analysiscenter.veracode.com)
+2. Press F12 → Network tab → Refresh page
+3. Click any request → Headers → Copy `Cookie:` value
+4. Save to `cookies.txt`
 
-### Performance Tips
-- **Small deployments** (< 50 apps): Default settings work well
-- **Large deployments** (100+ apps): Consider increasing `--max-workers 20 --rate-limit 20`
-- **Very large deployments** (500+ apps): Test with `--max-workers 30 --rate-limit 30`
-- Monitor for 429 errors; reduce rate limit if encountered
-
-### Example - Optimized for Large Scale
+**Step 2: Fetch IaC findings**
 ```bash
-python script.py \
-  --max-workers 20 \
-  --rate-limit 20 \
-  --output all-findings.csv
+python fetch_iac_details.py --cookies-file cookies.txt --output iac-findings.json --filter-apps "App1,App2"
 ```
 
-## IaC (Infrastructure as Code) Integration
-
-### Overview
-
-The script can include IaC scan results from Veracode's Container Security alongside regular findings (SAST, DAST, SCA, Manual). Each individual IaC finding becomes a separate row in the output CSV with full details including file paths, line numbers, and rule IDs.
-
-### Quick Start - Fetching IaC Data
-
-Use the included `fetch_iac_details.py` script to fetch detailed IaC findings from Veracode:
-
-#### Step 1: Get your browser session cookies
-
-1. Log into Veracode Platform (proxy as correct org if needed)
-2. Open Chrome/Edge Developer Tools (F12)
-3. Go to Network tab
-4. Refresh the page or navigate to any page
-5. Click on any request to `analysiscenter.veracode.com`
-6. In Headers section, find **"Cookie:"** and copy the entire value
-7. Save it to a file: `cookies.txt`
-
-#### Step 2: Fetch detailed IaC findings
-
+**Step 3: Include in export**
 ```bash
-python fetch_iac_details.py \
-  --cookies-file cookies.txt \
-  --output iac-findings.json \
-  --filter-apps "Org/Repo"
+python script.py --app-name "App1,App2" --iac-json iac-findings.json
 ```
 
-This will:
-1. Fetch the list of all IaC scans
-2. Filter to your specified applications
-3. Fetch detailed findings for each scan
-4. Save everything to `iac-findings.json`
-
-#### Step 3: Include IaC in your findings export
-
-```bash
-python script.py \
-  --app-name "Org/Repo" \
-  --iac-json iac-findings.json \
-  --output complete-findings.csv
-```
-
-### IaC Fetcher Script Options
-
-The `fetch_iac_details.py` script supports these arguments:
-
-|Argument            |Description                                                           |
-|--------------------|----------------------------------------------------------------------|
-|`--cookies-file`    |File containing browser session cookies (recommended)                 |
-|`--cookies`         |Browser session cookies as string (use --cookies-file instead)        |
-|`--output`          |Output file for detailed findings (default: iac-findings.json)        |
-|`--scan-limit`      |Max scans to fetch (default: 5000)                                    |
-|`--findings-limit`  |Max findings per scan (default: 1000)                                 |
-|`--filter-apps`     |Comma-separated app names to process (optional)                       |
-|`--sleep`           |Sleep between API calls in seconds (default: 0.5)                     |
-
-### IaC JSON Structure
-
-The `iac-findings.json` file contains:
-```json
-{
-  "records": [
-    {
-      "asset_name": "Org/Repo",
-      "scan_id": 602410,
-      "scanned_at": "2026-03-02T17:45:27.777179",
-      "detailed_findings": [
-        {
-          "severity": "high",
-          "title": "Container running as root",
-          "description": "Container is running as root user which poses security risks",
-          "rule_id": "CIS-DI-0001",
-          "file_path": "Dockerfile",
-          "line_number": "12"
-        }
-      ]
-    }
-  ],
-  "metadata": {
-    "total_scans": 7,
-    "total_findings": 156
-  }
-}
-```
-
-### How IaC Findings Appear in CSV
-
-Each individual IaC finding becomes one row in the CSV with full details:
-- **Description**: Full finding description with rule ID (e.g., "Container running as root - Container is running as root user which poses security risks [Rule: CIS-DI-0001]")
-- **Vulnerability Title**: Finding title (first 100 chars)
-- **Flaw Name**: Finding title
-- **CWE ID**: IaC rule ID (e.g., "CIS-DI-0001")
-- **Filename/Class**: File path and line number (e.g., "Dockerfile:12")
-- **Scan Type**: `IAC`
-- **Custom Severity Name**: Very High, High, Medium, Low, Very Low, Informational
-- **Severity**: Numeric severity (5=Critical, 4=High, 3=Medium, 2=Low, 1=Negligible, 0=Unknown)
-- **First Found Date**: Scan date from IaC record
-- **Finding Status**: "OPEN"
-- **Team Name**: Extracted from app profile (Business Unit or first team)
-
-### IaC Fields in Output
-
-
-
-For each IaC finding, these columns are populated:
-
-
-
-- **Application Name**: Name from IaC scan record
-
-- **Application ID**: GUID (matched from app list)
-
-- **Scan Type**: `IAC`
-
-- **Custom Severity Name**: Very High, High, Medium, Low, Very Low, Informational
-
-- **Severity**: Numeric severity (5=Critical, 4=High, 3=Medium, 2=Low, 1=Negligible, 0=Unknown)
-
-- **First Found Date**: Scan date from IaC record
-
-- **Finding Status**: "OPEN"
-
-- **Team Name**: Extracted from app profile
-
-- **Description**: Full finding description with rule ID
-
-- **Vulnerability Title**: Finding title (first 100 chars)
-
-- **CWE ID**: IaC rule ID
-
-- **Flaw Name**: Finding title
-
-- **Filename/Class**: File path and line number
-
-
-
-**These columns are always blank for IaC findings:**
-
-- CVE ID, CVSS, Fixed Date, Days to Resolve, Resolution Status, Resolution, Sandbox Name
-
-### IaC Filtering
-
-- IaC findings are **automatically filtered** to match your `--app-name` list
-- Only IaC scans for applications in your filtered list are included
-- The script validates that the IaC JSON contains detailed findings
-- The script shows scan counts and total findings during processing
-
-### Manual Method (Not Recommended)
-
-The manual method only provides summary counts (not individual findings), so it's **not compatible** with this script:
-
-1. **Summary data URL** (not sufficient):
-   ```
-   https://ui.analysiscenter.veracode.com/container-scan-query/v1/scans?page=0&limit=5000
-   ```
-   This only gives you severity counts, not individual finding details.
-
-2. **Use the fetcher script instead**:
-   ```bash
-   python fetch_iac_details.py --cookies-file cookies.txt
-   ```
-   The fetcher script automatically gets both the summary and detailed findings for you.
-
-### Example Output with IaC
-
-```
-======================================================================
-  PROCESSING IAC SCAN DATA
-======================================================================
-
-✓ Loaded IaC data from iac-findings.json
-  Found 7 IaC scans with 156 total findings
-
-  Processing detailed IaC findings...
-
-  Processing Org/Repo: 39 findings
-  Processing Org/Repo: 12 findings
-  ...
-
-  ✓ Processed 7 applications
-  ✓ Added 156 individual IaC findings
-
-======================================================================
-  EXPORT COMPLETED
-======================================================================
-  Applications processed    : 7
-  Applications with findings: 7
-  Total findings            : 1417
-    - Regular scan findings : 1261
-    - IaC scan findings     : 156
-======================================================================
-```
+**Note:** Cookies expire after a few hours. The script validates the JSON contains detailed findings (not just summary counts).
 
 ## Output Files
 
-### CSV - `veracode_findings_api.csv`
+The script generates two output files:
+
+### 1. CSV File (Default: `veracode_findings_api.csv`)
+
+- Primary output containing all findings in tabular format
+- One row per finding across all scan types
+- Can be opened in Excel, imported into databases, or processed by other tools
+- Filename customizable via `--output` argument
+
+### 2. JSON File (Auto-generated: `veracode_findings_api_raw_<timestamp>.json`)
+
+- Raw API response data for all findings
+- Includes complete nested data structures from Veracode APIs
+- Useful for debugging, advanced analysis, or custom processing
+- Automatically timestamped to avoid overwriting previous exports
+- Contains all metadata that may not fit in CSV format
+
+**Example:**
+```bash
+python script.py --app-name "MyApp" --output myapp-findings.csv
+```
+**Generates:**
+- `myapp-findings.csv` - Main CSV output
+- `veracode_findings_api_raw_20260305_143022.json` - Raw JSON data
+
+
+
+### Standard Columns (All Scan Types)
 
 |Column              |Description                                                           |
 |--------------------|----------------------------------------------------------------------|
-|Application Name    |Application profile name                                              |
+|Application Name    |Application name from Veracode profile                                |
 |Application ID      |Application GUID                                                      |
-|Sandbox Name        |Sandbox name if finding is from a sandbox; blank for policy scan      |
+|Sandbox Name        |Sandbox name (blank for policy scans and IaC)                         |
 |Custom Severity Name|Very High / High / Medium / Low / Very Low / Informational            |
-|CVE ID              |CVE identifier (SCA findings only)                                    |
-|Description         |Finding description                                                   |
-|Vulnerability Title |First 100 characters of description                                   |
-|CWE ID              |CWE numeric ID (or IaC Rule ID for IaC findings)                      |
-|Flaw Name           |CWE name or finding category                                          |
-|First Found Date    |Date the finding was first observed                                   |
-|Filename/Class      |File, path, URL, or component — varies by scan type                   |
-|Finding Status      |`OPEN` or `CLOSED`                                                    |
-|Fixed Date          |Resolution date; falls back to last seen date if not available        |
-|Team Name           |Business unit name or first assigned team from the application profile|
-|Days to Resolve     |Days between first found and fixed date                               |
-|Scan Type           |STATIC, Dynamic Analysis, DAST, MANUAL, SCA, SCA Agent, or IAC       |
-|CVSS                |CVSS score (prefers v3 for SCA)                                       |
-|Severity            |Numeric severity 0–5                                                  |
-|Resolution Status   |Resolution status from the platform                                   |
-|Resolution          |Resolution type                                                       |
-|Veracode Link       |Deep link to finding in Veracode Platform (format varies by scan type)|
+|CVE ID              |CVE identifier (SCA/IaC vulnerabilities only). **IaC**: Finding ID if vulnerability type|
+|Description         |Full finding description (HTML tags stripped). **IaC**: Title + description + finding ID|
+|Vulnerability Title |Finding title or first 100 chars of description. **IaC**: Finding type (e.g., "Vulnerability", "Misconfiguration")|
+|CWE ID              |CWE numeric ID. **IaC**: Rule/Policy ID (e.g., "CIS-DI-0001")        |
+|Flaw Name           |CWE name, finding category, or title. **IaC**: Finding ID or title   |
+|First Found Date    |ISO 8601 date when finding was first observed. **IaC**: Scan date    |
+|Filename/Class      |File path (STATIC), URL (DYNAMIC), component (SCA). **IaC**: File path with line numbers (e.g., "Dockerfile (Lines 12-15)")|
+|Finding Status      |OPEN or CLOSED. **IaC**: Always OPEN                                  |
+|Fixed Date          |Resolution date (ISO 8601) - only populated when CLOSED/FIXED. **IaC**: Always blank|
+|Team Name           |Business unit name or first team from application profile             |
+|Days to Resolve     |Calculated days between first found and fixed. **IaC**: Always blank |
+|Scan Type           |STATIC, Dynamic Analysis, DAST, MANUAL, SCA, SCA Agent, or **IAC**   |
+|CVSS                |CVSS score (prefers v3 for SCA). **IaC**: CVSS from finding if available|
+|Severity            |Numeric severity: 5=Very High, 4=High, 3=Medium, 2=Low, 1=Very Low, 0=Informational. **IaC**: Mapped from critical/high/medium/low/negligible/unknown|
+|Resolution Status   |Resolution status from Veracode platform. **IaC**: Always blank       |
+|Resolution          |Resolution type (e.g., APPROVED, FALSE POSITIVE, etc.). **IaC**: Always blank|
+|Mitigation Comments |Comments from annotations/mitigations. **IaC**: Suggested fix text    |
+|Veracode Link       |Deep link to finding in Veracode Platform (format varies by scan type). **IaC**: Link to Container Security scan|
 
-### JSON — `veracode_findings_api_raw_<timestamp>.json`
+### IAC-Specific Columns (IaC Findings Only)
 
-Raw API response data for all findings, saved for debugging.
+|Column              |Description                                                           |
+|--------------------|----------------------------------------------------------------------|
+|IAC File Path       |Full file path in repository where IaC issue was found               |
+|IAC Start Line      |Starting line number of the finding                                   |
+|IAC End Line        |Ending line number of the finding                                     |
 
-## How It Works
+**Note:** IAC-specific columns are blank for non-IaC findings. Standard columns may be blank for IaC findings (e.g., CVE ID, CVSS, Fixed Date, Days to Resolve, Resolution Status, Resolution).
 
-1. Fetches all application profiles via the Applications API (paginated)
-2. Fetches SCA workspace/project mappings for agent-based SCA findings
-3. Fetches Dynamic Analysis mappings for web application scanning findings
-4. Filters applications based on `--app-name` (comma-separated exact matches) or `--app-guid`
-5. Processes applications concurrently using thread pool (configurable via `--max-workers`)
-6. For each application, runs findings API calls with rate limiting:
-   - **Policy scan** — always fetched (no `context` parameter)
-   - **Sandboxes** — fetched per sandbox using `?context={sandbox_guid}` if `--include-sandbox` is set
-   - **SCA** — always fetched in a dedicated separate pass, as required by the Veracode API
-7. If `--iac-json` is provided:
-   - Loads IaC detailed findings from the JSON file
-   - Validates that the file contains detailed findings (not just summary counts)
-   - Matches IaC scans to applications by name
-   - Creates one row per individual IaC finding with full details
-   - Filters to only include applications in your filtered list
-8. Normalizes fields across scan types and calculates derived values (e.g. days to resolve)
-9. Generates deep links to findings in Veracode Platform based on scan type
-10. Writes results to CSV and raw JSON
+## Performance Tuning
+
+**Default (< 50 apps):**
+```bash
+python script.py  # Uses --max-workers 10 --rate-limit 10
+```
+
+**Large deployments (100+ apps):**
+```bash
+python script.py --max-workers 20 --rate-limit 20
+```
+
+**Very large (500+ apps):**
+```bash
+python script.py --max-workers 30 --rate-limit 30
+```
 
 ## Severity Mapping
 
@@ -435,71 +200,167 @@ Raw API response data for all findings, saved for debugging.
 |1      |Very Low     |
 |0      |Informational|
 
+## How It Works
+
+### Execution Flow
+
+1. **Initialization**
+   - Validates API credentials
+   - Creates optimized HTTP sessions with connection pooling
+   - Initializes rate limiter with token bucket algorithm
+
+2. **Data Collection Phase**
+   - Fetches all application profiles (paginated, supports 1000s of apps)
+   - Retrieves SCA workspace/project mappings for agent-based findings
+   - Fetches Dynamic Analysis scan mappings
+   - Filters applications by `--app-name` or `--app-guid` if specified
+
+3. **Concurrent Processing**
+   - Submits all applications to thread pool executor
+   - Each worker thread processes one application at a time
+   - Rate limiter coordinates requests across all threads
+   - Applications are processed in parallel for optimal performance
+
+4. **Finding Extraction (Per Application)**
+   - Fetches policy scan findings (all scan types except SCA)
+   - Fetches SCA findings separately (API requirement)
+   - If `--include-sandbox`: iterates through all sandboxes and repeats above
+   - Enriches findings with application metadata and deep links
+   - Maps SCA Agent findings to workspace/project IDs
+   - Maps Dynamic findings to Dynamic Analysis IDs
+
+5. **IaC Integration (If Enabled)**
+   - Loads detailed IaC findings from JSON file
+   - Validates file contains detailed findings (not just summary)
+   - Matches IaC asset names to Veracode applications using fuzzy logic
+   - Creates placeholder entries for unmatched IaC assets
+   - Normalizes IaC findings to match standard schema
+
+6. **Post-Processing**
+   - Normalizes all findings to common schema
+   - Strips HTML tags and entities from descriptions
+   - Calculates derived fields (Days to Resolve, etc.)
+   - Generates Veracode Platform deep links based on scan type
+
+7. **Output Generation**
+   - Writes raw JSON with complete API responses (timestamped)
+   - Writes normalized CSV with all findings
+   - Displays summary statistics
+
+
 ## Troubleshooting
 
-**401 / 403** — Check credentials file format and that your account has the Results API or Reviewer role.
+### Authentication Issues
 
-**0 applications returned** — Verify your account has access to application profiles and you're using the correct API region.
+**401/403 errors** 
+- Check API credentials file exists and has correct format
+- Verify account has Results API role (Service Account) or Reviewer/Security Lead role (User Account)
+- Confirm credentials file location: `~/.veracode/credentials` (Mac/Linux) or `C:\Users\<username>\.veracode\credentials` (Windows)
 
-**404 on specific applications** — Normal; the app likely has no scans yet or your account lacks permission for that profile. The script skips and continues.
+**0 applications returned** 
+- User accounts only see applications assigned to their teams/business units
+- API Service Accounts see all applications in the organization
+- Verify you're querying the correct API region (US/EU)
+- Test with `--max-apps 5` to verify API connectivity
 
-**429 Too Many Requests** — Increase `--sleep` (e.g. `--sleep 1.5`). Avoid running multiple instances simultaneously.
+### Performance Issues
 
-**Missing fields in CSV** — CVE ID is SCA-only. Sandbox Name is blank for policy scan findings. Fixed Date requires the finding to be CLOSED or FIXED. CWE ID contains the IaC rule ID for IaC findings (not a CWE number).
+**429 Too Many Requests** 
+- Reduce `--rate-limit` (try `--rate-limit 5` or lower)
+- Reduce `--max-workers` (try `--max-workers 5`)
+- Avoid running multiple instances simultaneously
+- Check if other API clients are running against same account
 
-**IaC file not found** — Ensure the path to your IaC JSON file is correct. Use absolute or relative paths.
+**Script running slowly**
+- Increase `--max-workers` for large deployments (20-30 for 100+ apps)
+- Increase `--rate-limit` if not encountering 429 errors
+- Note: Large applications with many findings will naturally take longer
 
-**IaC wrong format error** — The script requires detailed findings, not summary counts. Use `fetch_iac_details.py` to fetch the correct format.
+### Data Issues
 
-**IaC applications not matched** — IaC matching is **case-sensitive and exact**. Ensure the `asset_name` in your IaC JSON exactly matches the application names in Veracode. The script will warn you if applications are not found.
+**Missing CSV fields** 
+- Some fields only apply to specific scan types:
+  - CVE ID: SCA and IaC vulnerabilities only
+  - Sandbox Name: Only populated for sandbox scans
+  - Fixed Date: Only when Finding Status = CLOSED or Resolution Status = FIXED
+  - Days to Resolve: Only when Fixed Date is available
+  - CVSS: Primarily SCA findings
+- This is expected behavior, not an error
 
-**IaC cookies expired** — Browser session cookies typically expire after a few hours. Get fresh cookies from your browser and update `cookies.txt`.
+**IaC cookies expired** 
+- Browser session cookies typically expire after 2-4 hours
+- Get fresh cookies by logging into Veracode Platform again
+- Copy new Cookie header value from browser Developer Tools
+- Update `cookies.txt` file
 
-## Use Case Examples
+**IaC applications not matched**
+- IaC matching uses fuzzy logic to match asset names to application names
+- If no match found, IaC findings are still included with placeholder app profile
+- Check console output for "No matching application found" warnings
+- Verify asset names in IaC JSON match application names in Veracode
 
-### Export findings for specific applications
+**IaC wrong format error**
+- The script requires detailed findings, not summary counts
+- Use `fetch_iac_details.py` to fetch the correct format
+- Do not use the manual API endpoint (only provides summary)
 
+### Application-Specific Issues
+
+**404 on specific applications** 
+- Application may have no scans yet
+- Your account may lack permission for that specific application
+- Application may have been deleted or archived
+- Script will skip and continue with other applications (expected behavior)
+
+**Sandboxes not appearing**
+- Ensure `--include-sandbox` flag is used
+- User must have explicit permission to each sandbox
+- Some applications may have no sandboxes (not an error)
+
+**SCA Agent findings missing workspace links**
+- SCA Agent workspace/project mappings are fetched automatically
+- If mappings fail, basic links to SCA workspace list are provided
+- This is a fallback and doesn't affect other data
+
+### Verification
+
+**Test with limited scope:**
 ```bash
-python script.py \
-  --app-name "Org/Repo" \
-  --output Org-repo.csv
+# Test with single application
+python script.py --app-name "TestApp" --max-apps 1
+
+# Test API connectivity
+python script.py --max-apps 5 --output test.csv
 ```
 
-### Export findings including IaC for specific applications
+**Check raw JSON output:**
+- Review `veracode_findings_api_raw_<timestamp>.json` for complete API responses
+- Useful for debugging missing data or unexpected behavior
 
+## Common Use Cases
+
+**Specific applications with all scan types:**
 ```bash
-# Step 1: Fetch IaC data
-python fetch_iac_details.py \
-  --cookies-file cookies.txt \
-  --output iac-findings.json \
-  --filter-apps "Org/Repo"
-
-# Step 2: Export all findings
-python script.py \
-  --app-name "Org/Repo" \
-  --iac-json iac-findings.json \
-  --include-sandbox \
-  --output Org-Repo-complete.csv
+python fetch_iac_details.py --cookies-file cookies.txt --output iac-findings.json --filter-apps "App1,App2"
+python script.py --app-name "App1,App2" --iac-json iac-findings.json --include-sandbox
 ```
 
-### Export only high severity open findings with IaC
-
+**High severity open findings only:**
 ```bash
-python script.py \
-  --app-name "Org/Repo" \
-  --severity-gte 4 \
-  --status OPEN \
-  --iac-json iac-findings.json \
-  --output high-severity-open.csv
+python script.py --severity-gte 4 --status OPEN --output high-severity.csv
+```
+
+**Testing with limited apps:**
+```bash
+python script.py --max-apps 5
 ```
 
 ## API References
 
 - [Findings REST API](https://docs.veracode.com/r/c_findings_v2_intro)
 - [Applications REST API](https://docs.veracode.com/r/c_apps_intro)
-- [Container Security (IaC Scans)](https://docs.veracode.com/r/Veracode_Container_Security)
 - [API Authentication](https://docs.veracode.com/r/t_install_api_authen)
 
-## License
+---
 
-This is a community tool and is not officially supported by Veracode.
+**Note:** This is a community tool and is not officially supported by Veracode.
