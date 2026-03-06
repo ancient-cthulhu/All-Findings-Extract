@@ -282,42 +282,75 @@ def get_sca_workspaces(session, sleep_time=0.5, rate_limiter=None):
     workspace_project_map = {}
     
     try:
-        if rate_limiter:
-            rate_limiter.acquire()
+        # Paginate through ALL workspaces
+        page = 0
+        all_workspaces = []
         
-        resp = session.get(
-            f"{sca_api_base}/workspaces",
-            auth=RequestsAuthPluginVeracodeHMAC(),
-            timeout=60,
-        )
+        while True:
+            if rate_limiter:
+                rate_limiter.acquire()
+            
+            resp = session.get(
+                f"{sca_api_base}/workspaces",
+                params={"page": page, "size": 500},
+                auth=RequestsAuthPluginVeracodeHMAC(),
+                timeout=60,
+            )
+            
+            if resp.status_code != 200:
+                break
+            
+            data = resp.json()
+            workspaces = data.get("_embedded", {}).get("workspaces", [])
+            
+            if not workspaces:
+                break
+            
+            all_workspaces.extend(workspaces)
+            
+            # Check if there's a next page
+            if not data.get("_links", {}).get("next"):
+                break
+            
+            page += 1
+            if sleep_time > 0:
+                time.sleep(sleep_time)
         
-        if resp.status_code != 200:
-            return workspace_project_map
+        print(f"  Fetched {len(all_workspaces)} SCA workspaces")
         
-        data = resp.json()
-        workspaces = data.get("_embedded", {}).get("workspaces", [])
-        
-        for workspace in workspaces:
+        # Now fetch projects for each workspace with pagination
+        total_projects = 0
+        for workspace in all_workspaces:
             workspace_id = workspace.get("id")
             workspace_site_id = workspace.get("site_id")
             
             if not workspace_id:
                 continue
             
-            projects_url = f"{sca_api_base}/workspaces/{workspace_id}/projects"
+            # Paginate through all projects in this workspace
+            project_page = 0
             
-            if rate_limiter:
-                rate_limiter.acquire()
-            
-            resp = session.get(
-                projects_url,
-                auth=RequestsAuthPluginVeracodeHMAC(),
-                timeout=60,
-            )
-            
-            if resp.status_code == 200:
+            while True:
+                projects_url = f"{sca_api_base}/workspaces/{workspace_id}/projects"
+                
+                if rate_limiter:
+                    rate_limiter.acquire()
+                
+                resp = session.get(
+                    projects_url,
+                    params={"page": project_page, "size": 500},
+                    auth=RequestsAuthPluginVeracodeHMAC(),
+                    timeout=60,
+                )
+                
+                if resp.status_code != 200:
+                    break
+                
                 projects_data = resp.json()
                 projects = projects_data.get("_embedded", {}).get("projects", [])
+                
+                if not projects:
+                    break
                 
                 for project in projects:
                     project_site_id = project.get("site_id")
@@ -332,12 +365,24 @@ def get_sca_workspaces(session, sleep_time=0.5, rate_limiter=None):
                             "project_name": project_name
                         }
                         
+                        # Map by project name (case-insensitive)
                         workspace_project_map[project_name.lower()] = mapping
                         
+                        # Map by linked app GUID if available
                         if linked_app_guid:
                             workspace_project_map[f"guid:{linked_app_guid}"] = mapping
-            
-            # Sleep removed - rate limiter handles this
+                        
+                        total_projects += 1
+                
+                # Check if there's a next page of projects
+                if not projects_data.get("_links", {}).get("next"):
+                    break
+                
+                project_page += 1
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+        
+        print(f"  Fetched {total_projects} total SCA projects across all workspaces")
         
     except Exception as e:
         print(f"    WARNING: Could not fetch SCA workspaces: {e}")
@@ -769,22 +814,21 @@ def generate_veracode_link(app_guid, scan_type, finding_details, sandbox_guid=No
                 if workspace_guid and project_id:
                     return f"https://sca.analysiscenter.veracode.com/workspaces/{workspace_guid}/projects/{project_id}/issues"
                 else:
-                    return "https://sca.analysiscenter.veracode.com/workspaces"
-            
-            scan_params = None
-            if finding_obj:
-                scan_params = finding_obj.get("_latest_scan_params")
-            
-            if scan_params and app_oid and app_id:
-                return f"{base_analysis_center}#ReviewResultsSCA:{app_oid}:{app_id}:{scan_params}"
-            elif app_oid and app_id:
-                return f"{base_analysis_center}#AnalyzeAppSourceComposition:{app_oid}:{app_id}:"
+                    return "https://sca.analysiscenter.veracode.com/workspaces"            
+        scan_params = None
+        if finding_obj:
+            scan_params = finding_obj.get("_latest_scan_params")
+        
+        if scan_params and app_oid and app_id:
+            return f"{base_analysis_center}#ReviewResultsSCA:{app_oid}:{app_id}:{scan_params}"
+        elif app_oid and app_id:
+            return f"{base_analysis_center}#AnalyzeAppSourceComposition:{app_oid}:{app_id}:"
+        else:
+            if sandbox_guid:
+                return f"{base_analysis_center}#AnalyzeAppSourceComposition:{app_guid}:{sandbox_guid}"
             else:
-                if sandbox_guid:
-                    return f"{base_analysis_center}#AnalyzeAppSourceComposition:{app_guid}:{sandbox_guid}"
-                else:
-                    return f"{base_analysis_center}#AnalyzeAppSourceComposition:{app_guid}:"
-    
+                return f"{base_analysis_center}#AnalyzeAppSourceComposition:{app_guid}:"
+
     return f"{base_analysis_center}#AnalyzeAppModuleList:{app_guid}:"
 
 
@@ -1122,10 +1166,20 @@ def process_single_application(app, idx, total, filters, sleep_time, include_san
         
         if finding.get("scan_type") == "SCA":
             metadata = finding.get("finding_details", {}).get("metadata", {})
-            if metadata.get("sca_scan_mode") == "AGENT":
+            sca_scan_mode = metadata.get("sca_scan_mode", "")
+            
+            if sca_scan_mode == "AGENT":
                 guid_key = f"guid:{app_guid}"
+                mapping = None
+                
                 if guid_key in sca_workspace_map:
                     mapping = sca_workspace_map[guid_key]
+                else:
+                    app_name_lower = app_name.lower()
+                    if app_name_lower in sca_workspace_map:
+                        mapping = sca_workspace_map[app_name_lower]
+                
+                if mapping:
                     finding["_sca_workspace_guid"] = mapping["workspace_guid"]
                     finding["_sca_project_id"] = mapping["project_id"]
         
@@ -1241,6 +1295,32 @@ def main():
             applications = applications[: args.max_apps]
             print(f"Limited to {args.max_apps} applications (for testing)\n")
 
+    # Filter SCA workspace map to only include projects relevant to our filtered applications
+    if sca_workspace_map and applications:
+        filtered_app_guids = {app.get("guid") for app in applications if app.get("guid")}
+        filtered_app_names = {app.get("profile", {}).get("name", "").lower() for app in applications}
+        filtered_app_names.discard("")  # Remove empty names
+        
+        original_count = len(sca_workspace_map)
+        
+        # Keep only mappings that match our filtered apps
+        filtered_sca_map = {}
+        for key, mapping in sca_workspace_map.items():
+            # Keep GUID-based mappings that match our filtered apps
+            if key.startswith("guid:"):
+                app_guid = key[5:]  # Remove "guid:" prefix
+                if app_guid in filtered_app_guids:
+                    filtered_sca_map[key] = mapping
+            # Keep name-based mappings that match our filtered app names
+            elif key.lower() in filtered_app_names:
+                filtered_sca_map[key] = mapping
+        
+        sca_workspace_map = filtered_sca_map
+        print(f"  Filtered SCA mappings: {original_count} → {len(sca_workspace_map)} (relevant to selected apps)")
+        if sca_workspace_map:
+            sample_keys = list(sca_workspace_map.keys())[:5]
+            print(f"  Sample filtered SCA mappings: {sample_keys}")
+    
     print("\n" + "=" * 70)
     print("  FETCHING FINDINGS FROM APPLICATIONS")
     print("=" * 70 + "\n")
@@ -1296,9 +1376,6 @@ def main():
                     "profile": app_profile
                 }
             
-            print(f"  DEBUG: Created app_map with {len(app_map)} applications")
-            print(f"  DEBUG: Sample app names in map: {list(app_map.keys())[:5]}")
-            
             iac_findings_count = 0
             iac_apps_processed = 0
             
@@ -1307,33 +1384,17 @@ def main():
             for iac_record in iac_records:
                 asset_name = iac_record.get('asset_name', '')
                 
+                # Only exact match (case-insensitive)
                 matched_app = None
                 if asset_name in app_map:
                     matched_app = asset_name
                 else:
+                    # Try case-insensitive exact match
                     asset_name_lower = asset_name.lower()
-                    asset_name_normalized = asset_name_lower.replace('/', '').replace('-', '').replace('_', '').replace(' ', '')
-                    
-                    if len(asset_name_normalized) >= 3:
-                        for app_name in app_map.keys():
-                            app_name_lower = app_name.lower()
-                            app_name_normalized = app_name_lower.replace('-', '').replace('_', '').replace(' ', '')
-                            
-                            if len(app_name_normalized) < 3:
-                                continue
-                            
-                            if app_name_lower in asset_name_lower:
-                                matched_app = app_name
-                                break
-                            elif asset_name_lower in app_name_lower:
-                                matched_app = app_name
-                                break
-                            elif app_name_normalized and app_name_normalized in asset_name_normalized:
-                                matched_app = app_name
-                                break
-                            elif asset_name_normalized and asset_name_normalized in app_name_normalized:
-                                matched_app = app_name
-                                break
+                    for app_name in app_map.keys():
+                        if app_name.lower() == asset_name_lower:
+                            matched_app = app_name
+                            break
                 
                 # If no match found, create placeholder entry for this IAC asset
                 if not matched_app:
@@ -1395,13 +1456,8 @@ def main():
             # Check if already normalized (has "Application Name" key instead of "_app_name")
             if "Application Name" in f:
                 normalized_findings.append(f)
-                if f.get("Scan Type") == "IAC":
-                    iac_in_list += 1
             else:
                 normalized_findings.append(normalize_finding(f))
-        
-        print(f"  DEBUG: Total normalized findings: {len(normalized_findings)}")
-        print(f"  DEBUG: IAC findings in list: {iac_in_list}")
 
         fieldnames = [
             "Application Name",
