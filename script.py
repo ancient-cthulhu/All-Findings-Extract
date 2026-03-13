@@ -18,14 +18,19 @@ APPLICATIONS_URL = f"{BASE_URL}/appsec/v1/applications"
 SANDBOXES_URL_TEMPLATE = f"{BASE_URL}/appsec/v1/applications/{{app_guid}}/sandboxes"
 FINDINGS_URL_TEMPLATE = f"{BASE_URL}/appsec/v2/applications/{{app_guid}}/findings"
 
-DEFAULT_PAGE_SIZE = 1000  # Increased from 500 for better performance
+DEFAULT_PAGE_SIZE = 1000
 NON_SCA_SCAN_TYPES = ["STATIC", "DYNAMIC", "MANUAL"]
 
 
-def create_optimized_session():
-    """Create a session with optimized connection pooling settings."""
-    session = requests.Session()
+def create_optimized_session(ca_cert=None):
+    """Create a session with optimized connection pooling settings.
     
+    Args:
+        ca_cert: Optional path to a custom CA certificate bundle (.pem).
+                 Required when running behind an SSL inspection device.
+    """
+    session = requests.Session()
+
     # Configure connection pool
     adapter = requests.adapters.HTTPAdapter(
         pool_connections=20,  # Number of connection pools
@@ -33,23 +38,26 @@ def create_optimized_session():
         max_retries=3,        # Retry on transient failures
         pool_block=False      # Don't block if pool is full
     )
-    
+
     session.mount('http://', adapter)
     session.mount('https://', adapter)
-    
+
+    if ca_cert:
+        session.verify = ca_cert
+
     return session
 
 
 class RateLimiter:
     """Thread-safe rate limiter using token bucket algorithm."""
-    
+
     def __init__(self, requests_per_second=10):
         self.requests_per_second = requests_per_second
         self.tokens = requests_per_second
         self.max_tokens = requests_per_second
         self.last_update = time.time()
         self.lock = threading.Lock()
-    
+
     def acquire(self):
         """Wait until a token is available, then consume it."""
         with self.lock:
@@ -58,11 +66,11 @@ class RateLimiter:
                 elapsed = now - self.last_update
                 self.tokens = min(self.max_tokens, self.tokens + elapsed * self.requests_per_second)
                 self.last_update = now
-                
+
                 if self.tokens >= 1:
                     self.tokens -= 1
                     return
-                
+
                 sleep_time = (1 - self.tokens) / self.requests_per_second
                 time.sleep(sleep_time)
 
@@ -71,30 +79,23 @@ def strip_html_tags(text):
     """Remove HTML tags and decode HTML entities from text. Also handles base64-encoded HTML."""
     if not text:
         return text
-    
-    # Try to detect and decode base64-encoded content
-    # Base64 strings are typically long and don't contain spaces
+
     if len(text) > 100 and ' ' not in text and text.isascii():
         try:
-            import base64
-            # Try to decode as base64
             decoded_bytes = base64.b64decode(text, validate=True)
-            # Try to decode as UTF-8
             decoded_text = decoded_bytes.decode('utf-8', errors='ignore')
-            # If it looks like HTML, use the decoded version
             if '<' in decoded_text and '>' in decoded_text:
                 text = decoded_text
         except Exception:
-            # Not base64 or failed to decode, use original text
             pass
-    
+
     # Remove HTML tags
     text = re.sub(r'<[^>]+>', '', text)
     # Decode HTML entities
     text = html.unescape(text)
     # Normalize whitespace
     text = re.sub(r'\s+', ' ', text).strip()
-    
+
     return text
 
 
@@ -172,6 +173,12 @@ def parse_args():
         help="Path to IaC scan results JSON file (optional). "
              "IaC findings will be added as separate rows in the output.",
     )
+    parser.add_argument(
+        "--ca-cert",
+        help="Path to a custom CA certificate bundle (.pem) for environments behind an SSL "
+             "inspection device (e.g. Zscaler). If your cert is DER-encoded (.cer), convert "
+             "first: openssl x509 -inform DER -in corp-ca.cer -out corp-ca.pem",
+    )
     return parser.parse_args()
 
 
@@ -189,17 +196,17 @@ def get_applications(session, sleep_time=0.5, rate_limiter=None):
     while True:
         if page == 0:
             print(f"  Fetching applications...")
-        
+
         try:
             # Small delay between pages to avoid overwhelming API
             if page > 0:
                 time.sleep(0.1)
-            
+
             resp = session.get(
                 APPLICATIONS_URL,
                 params={"page": page, "size": 1000},
                 auth=RequestsAuthPluginVeracodeHMAC(),
-                timeout=45,  # Reduced from 60 for faster failure detection
+                timeout=45,
             )
 
             if resp.status_code != 200:
@@ -208,11 +215,10 @@ def get_applications(session, sleep_time=0.5, rate_limiter=None):
                 if consecutive_errors >= max_consecutive_errors:
                     print(f"  ERROR: Too many consecutive errors, stopping at {len(all_apps)} applications")
                     break
-                time.sleep(1)  # Wait before retry
+                time.sleep(1)
                 continue
 
-            consecutive_errors = 0  # Reset error counter on success
-            
+            consecutive_errors = 0
             data = resp.json()
             applications = data.get("_embedded", {}).get("applications", [])
 
@@ -220,15 +226,15 @@ def get_applications(session, sleep_time=0.5, rate_limiter=None):
                 break
 
             all_apps.extend(applications)
-            
-            if page == 0 or (page + 1) % 5 == 0:  # Show progress every 5 pages
+
+            if page == 0 or (page + 1) % 5 == 0:
                 print(f"  Retrieved {len(all_apps)} applications so far...")
 
             if not data.get("_links", {}).get("next"):
                 break
 
             page += 1
-            
+
         except KeyboardInterrupt:
             print(f"\n  Interrupted by user. Retrieved {len(all_apps)} applications so far.")
             break
@@ -238,7 +244,7 @@ def get_applications(session, sleep_time=0.5, rate_limiter=None):
             if consecutive_errors >= max_consecutive_errors:
                 print(f"  ERROR: Too many consecutive errors, stopping at {len(all_apps)} applications")
                 break
-            time.sleep(1)  # Wait before retry
+            time.sleep(1)
             continue
 
     print(f"\n  ✓ Total applications found: {len(all_apps)}\n")
@@ -252,7 +258,7 @@ def get_sandboxes_for_app(session, app_guid, sleep_time=0.5, rate_limiter=None):
     try:
         if rate_limiter:
             rate_limiter.acquire()
-        
+
         resp = session.get(
             url,
             auth=RequestsAuthPluginVeracodeHMAC(),
@@ -268,7 +274,6 @@ def get_sandboxes_for_app(session, app_guid, sleep_time=0.5, rate_limiter=None):
 
         data = resp.json()
         sandboxes = data.get("_embedded", {}).get("sandboxes", [])
-        # Sleep removed - rate limiter handles this
         return sandboxes
 
     except Exception as e:
@@ -280,168 +285,159 @@ def get_sca_workspaces(session, sleep_time=0.5, rate_limiter=None):
     """Fetch all SCA workspaces and projects for mapping agent-based findings."""
     sca_api_base = "https://api.veracode.com/srcclr/v3"
     workspace_project_map = {}
-    
+
     try:
-        # Paginate through ALL workspaces
         page = 0
         all_workspaces = []
-        
+
         while True:
             if rate_limiter:
                 rate_limiter.acquire()
-            
+
             resp = session.get(
                 f"{sca_api_base}/workspaces",
                 params={"page": page, "size": 500},
                 auth=RequestsAuthPluginVeracodeHMAC(),
                 timeout=60,
             )
-            
+
             if resp.status_code != 200:
                 break
-            
+
             data = resp.json()
             workspaces = data.get("_embedded", {}).get("workspaces", [])
-            
+
             if not workspaces:
                 break
-            
+
             all_workspaces.extend(workspaces)
-            
-            # Check if there's a next page
+
             if not data.get("_links", {}).get("next"):
                 break
-            
+
             page += 1
             if sleep_time > 0:
                 time.sleep(sleep_time)
-        
+
         print(f"  Fetched {len(all_workspaces)} SCA workspaces")
-        
-        # Now fetch projects for each workspace with pagination
+
         total_projects = 0
         for workspace in all_workspaces:
             workspace_id = workspace.get("id")
             workspace_site_id = workspace.get("site_id")
-            
+
             if not workspace_id:
                 continue
-            
-            # Paginate through all projects in this workspace
+
             project_page = 0
-            
+
             while True:
                 projects_url = f"{sca_api_base}/workspaces/{workspace_id}/projects"
-                
+
                 if rate_limiter:
                     rate_limiter.acquire()
-                
+
                 resp = session.get(
                     projects_url,
                     params={"page": project_page, "size": 500},
                     auth=RequestsAuthPluginVeracodeHMAC(),
                     timeout=60,
                 )
-                
+
                 if resp.status_code != 200:
                     break
-                
+
                 projects_data = resp.json()
                 projects = projects_data.get("_embedded", {}).get("projects", [])
-                
+
                 if not projects:
                     break
-                
+
                 for project in projects:
                     project_site_id = project.get("site_id")
                     project_name = project.get("name", "")
                     linked_app = project.get("linked_application", {})
                     linked_app_guid = linked_app.get("guid")
-                    
+
                     if project_site_id and workspace_site_id:
                         mapping = {
                             "workspace_guid": workspace_site_id,
                             "project_id": project_site_id,
                             "project_name": project_name
                         }
-                        
-                        # Map by project name (case-insensitive)
+
                         workspace_project_map[project_name.lower()] = mapping
-                        
-                        # Map by linked app GUID if available
+
                         if linked_app_guid:
                             workspace_project_map[f"guid:{linked_app_guid}"] = mapping
-                        
+
                         total_projects += 1
-                
-                # Check if there's a next page of projects
+
                 if not projects_data.get("_links", {}).get("next"):
                     break
-                
+
                 project_page += 1
                 if sleep_time > 0:
                     time.sleep(sleep_time)
-        
+
         print(f"  Fetched {total_projects} total SCA projects across all workspaces")
-        
+
     except Exception as e:
         print(f"    WARNING: Could not fetch SCA workspaces: {e}")
-    
+
     return workspace_project_map
 
 
 def get_dynamic_analyses(session, sleep_time=0.5, rate_limiter=None):
-    """Fetch all Dynamic Analysis  analyses for mapping Dynamic findings."""
+    """Fetch all Dynamic Analysis analyses for mapping Dynamic findings."""
     dynamic_analyses_map = {}
-    
+
     try:
         if rate_limiter:
             rate_limiter.acquire()
-        
+
         resp = session.get(
             "https://api.veracode.com/was/configservice/v1/analyses",
             params={"size": 500},
             auth=RequestsAuthPluginVeracodeHMAC(),
             timeout=60,
         )
-        
+
         if resp.status_code != 200:
             return dynamic_analyses_map
-        
+
         data = resp.json()
         analyses = data.get("_embedded", {}).get("analyses", [])
-        
+
         for analysis in analyses:
             analysis_id = analysis.get("analysis_id")
             analysis_name = analysis.get("name")
-            
+
             if not analysis_id:
                 continue
-            
-            # Fetch scans for this analysis to get linked app info
+
             scans_url = f"https://api.veracode.com/was/configservice/v1/analyses/{analysis_id}/scans"
-            
+
             if rate_limiter:
                 rate_limiter.acquire()
-            
+
             resp_scans = session.get(
                 scans_url,
                 auth=RequestsAuthPluginVeracodeHMAC(),
                 timeout=60,
             )
-            
+
             if resp_scans.status_code == 200:
                 scans_data = resp_scans.json()
                 scans = scans_data.get("_embedded", {}).get("scans", [])
-                
+
                 for scan in scans:
                     linked_app_guid = scan.get("linked_platform_app_uuid")
-                    
+
                     if linked_app_guid:
-                        # Store Dynamic Analysis info mapped by app GUID
                         if linked_app_guid not in dynamic_analyses_map:
                             dynamic_analyses_map[linked_app_guid] = []
-                        
+
                         dynamic_analyses_map[linked_app_guid].append({
                             "analysis_id": analysis_id,
                             "analysis_name": analysis_name,
@@ -449,13 +445,13 @@ def get_dynamic_analyses(session, sleep_time=0.5, rate_limiter=None):
                             "scan_type": analysis.get("scan_type"),
                             "latest_occurrence_id": analysis.get("latest_occurrence_id"),
                         })
-            
+
             if sleep_time > 0:
                 time.sleep(sleep_time)
-        
+
     except Exception as e:
         print(f"    WARNING: Could not fetch Dynamic Analysis: {e}")
-    
+
     return dynamic_analyses_map
 
 
@@ -509,7 +505,7 @@ def get_findings_for_app(
         try:
             if rate_limiter:
                 rate_limiter.acquire()
-            
+
             resp = session.get(
                 url,
                 params=params,
@@ -711,7 +707,7 @@ def extract_mitigation_comments(finding):
     annotations = finding.get("annotations", [])
     if not annotations:
         return None
-    
+
     comments = []
     for annotation in annotations:
         comment = annotation.get("comment")
@@ -721,7 +717,7 @@ def extract_mitigation_comments(finding):
                 comments.append(f"[{action}] {comment}")
             else:
                 comments.append(comment)
-    
+
     return " | ".join(comments) if comments else None
 
 
@@ -729,18 +725,18 @@ def generate_veracode_link(app_guid, scan_type, finding_details, sandbox_guid=No
     """Generate the appropriate Veracode platform link based on scan type."""
     if not app_guid:
         return None
-    
+
     base_analysis_center = "https://analysiscenter.veracode.com/auth/index.jsp"
-    
+
     if scan_type == "STATIC":
         scan_params = None
-        
+
         if finding_obj:
             scan_params = finding_obj.get("_latest_scan_params")
-            
+
             if not scan_params:
                 scan_params = finding_obj.get("_finding_scan_params")
-        
+
         if scan_params and app_oid and app_id:
             return f"{base_analysis_center}#ReviewResultsAllFlaws:{app_oid}:{app_id}:{scan_params}"
         else:
@@ -749,7 +745,7 @@ def generate_veracode_link(app_guid, scan_type, finding_details, sandbox_guid=No
                 build_id = finding_obj.get("build_id")
             if not build_id and finding_details:
                 build_id = finding_details.get("build_id")
-            
+
             if build_id and app_oid and app_id:
                 return f"{base_analysis_center}#ReviewResultsAllFlaws:{app_oid}:{app_id}:{build_id}"
             elif app_oid and app_id:
@@ -759,66 +755,62 @@ def generate_veracode_link(app_guid, scan_type, finding_details, sandbox_guid=No
                     return f"{base_analysis_center}#AnalyzeAppModuleList:{app_guid}:{sandbox_guid}"
                 else:
                     return f"{base_analysis_center}#AnalyzeAppModuleList:{app_guid}:"
-    
+
     elif scan_type == "DYNAMIC":
-        # Check if this is a Dynamic Analysis scan
         dynamic_analysis_id = None
         if finding_obj:
             dynamic_analysis_id = finding_obj.get("_dynamic_analysis_id")
 
-        # Dynamic Analysis  - Link to analysis scans page
         if dynamic_analysis_id:
             return f"https://web.analysiscenter.veracode.com/was/#/analysis/{dynamic_analysis_id}/scans"
 
-        # Check for DAST scan URL
         dast_scan_url = None
         if finding_obj:
             dast_scan_url = finding_obj.get("_dast_scan_url")
 
         if dast_scan_url:
-            # DAST - Use DynamicParamsView link format
             return f"{base_analysis_center}#{dast_scan_url}"
 
-        # Fallback to dynamic analysis list view
         if sandbox_guid:
             return f"{base_analysis_center}#AnalyzeAppDynamicList:{app_guid}:{sandbox_guid}"
         else:
             return f"{base_analysis_center}#AnalyzeAppDynamicList:{app_guid}:"
-    
+
     elif scan_type == "MANUAL":
         if sandbox_guid:
             return f"{base_analysis_center}#AnalyzeAppManualList:{app_guid}:{sandbox_guid}"
         else:
             return f"{base_analysis_center}#AnalyzeAppManualList:{app_guid}:"
-    
+
     elif scan_type == "SCA":
         if finding_details:
             metadata = finding_details.get("metadata", {})
             sca_scan_mode = metadata.get("sca_scan_mode", "").upper()
-            
+
             if sca_scan_mode == "AGENT":
-                workspace_guid = (finding_details.get("workspace_guid") or 
+                workspace_guid = (finding_details.get("workspace_guid") or
                                 finding_details.get("workspace_id") or
                                 metadata.get("workspace_guid") or
                                 metadata.get("workspace_id"))
-                
+
                 project_id = (finding_details.get("project_id") or
                             metadata.get("project_id"))
-                
+
                 if finding_obj:
                     if not workspace_guid:
                         workspace_guid = finding_obj.get("_sca_workspace_guid") or finding_obj.get("workspace_guid") or finding_obj.get("workspace_id")
                     if not project_id:
                         project_id = finding_obj.get("_sca_project_id") or finding_obj.get("project_id")
-                
+
                 if workspace_guid and project_id:
                     return f"https://sca.analysiscenter.veracode.com/workspaces/{workspace_guid}/projects/{project_id}/issues"
                 else:
-                    return "https://sca.analysiscenter.veracode.com/workspaces"            
+                    return "https://sca.analysiscenter.veracode.com/workspaces"
+
         scan_params = None
         if finding_obj:
             scan_params = finding_obj.get("_latest_scan_params")
-        
+
         if scan_params and app_oid and app_id:
             return f"{base_analysis_center}#ReviewResultsSCA:{app_oid}:{app_id}:{scan_params}"
         elif app_oid and app_id:
@@ -841,19 +833,18 @@ def normalize_finding(finding):
     scan_type = finding.get("scan_type")
     original_scan_type = scan_type
     description = finding.get("description")
-    
+
     finding_details = finding.get("finding_details", {})
     if scan_type == "SCA":
         metadata = finding_details.get("metadata", {})
         if metadata.get("sca_scan_mode") == "AGENT":
             scan_type = "SCA Agent"
     elif scan_type == "DYNAMIC":
-        # Differentiate between Dynamic Analysis  and DAST
         if finding.get("_dynamic_analysis_id"):
             scan_type = "Dynamic Analysis"
         elif finding.get("_dast_scan_url"):
             scan_type = "DAST"
-    
+
     description = strip_html_tags(description)
 
     team_name = None
@@ -899,16 +890,16 @@ def normalize_finding(finding):
     }
     custom_severity = custom_severity_map.get(severity) if severity is not None else None
     days_to_resolve = calculate_days_to_resolve(first_found, fixed_date)
-    
+
     vuln_title = None
     if scan_type == "SCA" or scan_type == "SCA Agent":
         vuln_title = cve_id if cve_id else flaw_name
-    
+
     sandbox_guid = finding.get("_sandbox_guid")
     app_id = finding.get("_app_id")
     app_oid = finding.get("_app_oid")
     veracode_link = generate_veracode_link(app_guid, original_scan_type, finding_details, sandbox_guid, finding_obj=finding, app_id=app_id, app_oid=app_oid)
-    
+
     mitigation_comments = extract_mitigation_comments(finding)
 
     return {
@@ -944,19 +935,19 @@ def load_iac_data(iac_json_path):
             data = json.load(f)
         print(f"✓ Loaded IaC data from {iac_json_path}")
         records = data.get('records', [])
-        
+
         if not records:
             print(f"  ✗ No IaC records found in file")
             return []
-        
+
         if 'detailed_findings' not in records[0]:
             print(f"  ✗ ERROR: File does not contain detailed findings.")
             print(f"  Please use fetch_iac_details.py to fetch detailed findings.")
             return []
-        
+
         total_findings = sum(len(r.get('detailed_findings', [])) for r in records)
         print(f"  Found {len(records)} IaC scans with {total_findings} total findings")
-        
+
         return records
     except FileNotFoundError:
         print(f"✗ ERROR: IaC JSON file not found: {iac_json_path}")
@@ -967,6 +958,7 @@ def load_iac_data(iac_json_path):
     except Exception as e:
         print(f"✗ ERROR loading IaC data: {e}")
         return []
+
 
 def normalize_detailed_iac_finding(finding, iac_record, app_name, app_guid, app_profile):
     """Normalize a detailed IaC finding into the same format as regular findings."""
@@ -983,7 +975,7 @@ def normalize_detailed_iac_finding(finding, iac_record, app_name, app_guid, app_
                 first_team = teams[0]
                 if isinstance(first_team, dict):
                     team_name = first_team.get("team_name")
-    
+
     iac_severity_map = {
         "critical": (5, "Very High"),
         "high": (4, "High"),
@@ -992,69 +984,58 @@ def normalize_detailed_iac_finding(finding, iac_record, app_name, app_guid, app_
         "negligible": (1, "Very Low"),
         "unknown": (0, "Informational"),
     }
-    
+
     severity_str = finding.get('severity', 'unknown').lower()
     severity_level, severity_name = iac_severity_map.get(severity_str, (0, "Informational"))
-    
-    # Extract IAC-specific fields
-    finding_id = finding.get('id', '')  # Finding ID (e.g., CVE, GHSA)
-    finding_type = finding.get('finding_type', '')  # Finding Type (e.g., vulnerability, misconfiguration)
+
+    finding_id = finding.get('id', '')
+    finding_type = finding.get('finding_type', '')
     title = finding.get('title', '') or finding.get('description', 'IaC Misconfiguration')
     description = finding.get('description', '')
-    rule_id = finding.get('rule_id', '')  # Policy/Rule ID
-    
-    # File Path - can be string or list
+    rule_id = finding.get('rule_id', '')
+
     file_path_raw = finding.get('filepath', [])
     if isinstance(file_path_raw, list):
         file_path = file_path_raw[0] if file_path_raw else ''
     else:
         file_path = file_path_raw or ''
-    
-    # Line numbers
+
     start_line = finding.get('start_line', '')
     end_line = finding.get('end_line', '')
-    
-    # Suggested Fix
     suggested_fix = finding.get('suggested_fix', '')
-    
-    # CVSS Score
     cvss = finding.get('cvss', '')
-    
+
     title = strip_html_tags(title)
     description = strip_html_tags(description)
     suggested_fix = strip_html_tags(suggested_fix)
-    
-    # Build comprehensive description - include finding ID if available
+
     full_description = description or title
     if finding_id:
         full_description = f"{finding_id}: {full_description}"
-    
-    # Vulnerability Title = Finding Type (e.g., "vulnerability", "misconfiguration")
+
     vulnerability_title = finding_type.title() if finding_type else None
-    
-    # Build location string with line numbers
+
     location = file_path
     if start_line and end_line:
         location += f" (Lines {start_line}-{end_line})"
     elif start_line:
         location += f" (Line {start_line})"
-    
+
     scan_date = iac_record.get('scanned_at')
     scan_id = iac_record.get('scan_id', '')
     scan_url = f"https://web.analysiscenter.veracode.com/app/container-iac-scans/{scan_id}/summary" if scan_id else None
-    
-    # Use Finding ID as flaw name if available, otherwise use title
+
     flaw_name = finding_id if finding_id else title
-    
+
     return {
         "Application Name": app_name,
         "Application ID": app_guid,
         "Sandbox Name": None,
         "Custom Severity Name": severity_name,
-        "CVE ID": finding_id if finding_type == "vulnerability" else None,  # Use Finding ID as CVE for vulnerabilities
+        "CVE ID": finding_id if finding_type == "vulnerability" else None,
         "Description": full_description,
-        "Vulnerability Title": vulnerability_title,  # Finding Type goes here (e.g., "Vulnerability", "Misconfiguration")
-        "CWE ID": rule_id if rule_id else None,  # Use Rule ID as CWE
+        "Vulnerability Title": vulnerability_title,
+        "CWE ID": rule_id if rule_id else None,
         "Flaw Name": flaw_name,
         "First Found Date": scan_date,
         "Filename/Class": location if location else None,
@@ -1068,25 +1049,23 @@ def normalize_detailed_iac_finding(finding, iac_record, app_name, app_guid, app_
         "Resolution Status": None,
         "Resolution": None,
         "Veracode Link": scan_url,
-        "Mitigation Comments": suggested_fix if suggested_fix else None,  # Suggested Fix goes here
-        
-        # Keep only essential IAC-specific fields that don't have good standard equivalents
+        "Mitigation Comments": suggested_fix if suggested_fix else None,
         "IAC File Path": file_path,
         "IAC Start Line": start_line if start_line else None,
         "IAC End Line": end_line if end_line else None,
     }
 
 
-def process_single_application(app, idx, total, filters, sleep_time, include_sandboxes, sca_workspace_map, dynamic_analyses_map, rate_limiter):
+def process_single_application(app, idx, total, filters, sleep_time, include_sandboxes, sca_workspace_map, dynamic_analyses_map, rate_limiter, ca_cert=None):
     """Process a single application and return its findings. Designed to be called by worker threads."""
-    session = create_optimized_session()
-    
+    session = create_optimized_session(ca_cert=ca_cert)
+
     app_guid = app.get("guid")
     app_profile = app.get("profile", {})
     app_name = app_profile.get("name", "Unknown")
     app_id = app.get("id")
     app_oid = app.get("oid") or app.get("alt_org_id")
-    
+
     scan_params_by_build = {}
     dast_scan_params_by_build = {}
     scans = app.get("scans", [])
@@ -1102,16 +1081,14 @@ def process_single_application(app, idx, total, filters, sleep_time, include_san
                         scan_params_by_build[scan_build_id] = full_params
                     except (ValueError, IndexError):
                         pass
-        
+
         elif scan.get("scan_type") == "DYNAMIC":
             scan_url = scan.get("scan_url", "")
-            # Parse DAST scan URL format: DynamicParamsView:oid:app_id:build_id:unknown::scan_id
             if scan_url and scan_url.startswith("DynamicParamsView:"):
                 parts = scan_url.split(":")
                 if len(parts) >= 4:
                     try:
                         scan_build_id = int(parts[3])
-                        # Store the full scan URL for DAST
                         dast_scan_params_by_build[scan_build_id] = scan_url
                     except (ValueError, IndexError):
                         pass
@@ -1130,7 +1107,7 @@ def process_single_application(app, idx, total, filters, sleep_time, include_san
                         break
                     except (ValueError, IndexError):
                         pass
-    
+
     print(f"  [{idx}/{total}] {app_name}")
     print(f"    GUID: {app_guid}")
 
@@ -1146,60 +1123,58 @@ def process_single_application(app, idx, total, filters, sleep_time, include_san
         app_oid=app_oid,
         rate_limiter=rate_limiter,
     )
-    
+
     for finding in findings:
         finding["_latest_static_build_id"] = latest_static_build_id
         finding["_latest_scan_params"] = latest_scan_params
         finding["_scan_params_by_build"] = scan_params_by_build
         finding["_dast_scan_params_by_build"] = dast_scan_params_by_build
-        
+
         if finding.get("scan_type") == "STATIC":
             finding_build_id = finding.get("build_id")
             if finding_build_id and finding_build_id in scan_params_by_build:
                 finding["_finding_scan_params"] = scan_params_by_build[finding_build_id]
-        
-        # For DYNAMIC findings, lookup DAST scan URL by build_id
+
         elif finding.get("scan_type") == "DYNAMIC":
             finding_build_id = finding.get("build_id")
             if finding_build_id and finding_build_id in dast_scan_params_by_build:
                 finding["_dast_scan_url"] = dast_scan_params_by_build[finding_build_id]
-        
+
         if finding.get("scan_type") == "SCA":
             metadata = finding.get("finding_details", {}).get("metadata", {})
             sca_scan_mode = metadata.get("sca_scan_mode", "")
-            
+
             if sca_scan_mode == "AGENT":
                 guid_key = f"guid:{app_guid}"
                 mapping = None
-                
+
                 if guid_key in sca_workspace_map:
                     mapping = sca_workspace_map[guid_key]
                 else:
                     app_name_lower = app_name.lower()
                     if app_name_lower in sca_workspace_map:
                         mapping = sca_workspace_map[app_name_lower]
-                
+
                 if mapping:
                     finding["_sca_workspace_guid"] = mapping["workspace_guid"]
                     finding["_sca_project_id"] = mapping["project_id"]
-        
-        # Map Dynamic findings to Dynamic Analysis
+
         if finding.get("scan_type") == "DYNAMIC":
             if app_guid in dynamic_analyses_map:
                 dynamic_analyses = dynamic_analyses_map[app_guid]
                 if dynamic_analyses:
-                    # Use the first/latest Dynamic Analysis for this app
                     analysis_info = dynamic_analyses[0]
                     finding["_dynamic_analysis_id"] = analysis_info.get("analysis_id")
                     finding["_dynamic_analysis_name"] = analysis_info.get("analysis_name")
                     finding["_dynamic_analysis_scan_id"] = analysis_info.get("scan_id")
                     finding["_dynamic_analysis_scan_type"] = analysis_info.get("scan_type")
                     finding["_dynamic_analysis_occurrence_id"] = analysis_info.get("latest_occurrence_id")
+
     if findings:
         print(f"    ✓ Total findings for this app: {len(findings)}\n")
     else:
         print(f"    ✗ No findings\n")
-    
+
     session.close()
     return findings
 
@@ -1208,7 +1183,7 @@ def main():
     args = parse_args()
 
     include_sandboxes = args.include_sandbox
-    
+
     # Initialize rate limiter
     rate_limiter = RateLimiter(requests_per_second=args.rate_limit)
 
@@ -1219,6 +1194,8 @@ def main():
     print(f"  Include Sandboxes: {include_sandboxes}")
     print(f"  Max Workers      : {args.max_workers}")
     print(f"  Rate Limit       : {args.rate_limit} req/sec")
+    if args.ca_cert:
+        print(f"  CA Cert Bundle   : {args.ca_cert}")
     if args.app_name:
         print(f"  Filter App Name  : {args.app_name}")
     if args.app_guid:
@@ -1235,7 +1212,7 @@ def main():
         print(f"  Filter Status    : {args.status}")
     print("=" * 70 + "\n")
 
-    session = create_optimized_session()
+    session = create_optimized_session(ca_cert=args.ca_cert)
 
     print("\n" + "=" * 70)
     print("  FETCHING SCA WORKSPACE MAPPINGS")
@@ -1299,38 +1276,34 @@ def main():
     if sca_workspace_map and applications:
         filtered_app_guids = {app.get("guid") for app in applications if app.get("guid")}
         filtered_app_names = {app.get("profile", {}).get("name", "").lower() for app in applications}
-        filtered_app_names.discard("")  # Remove empty names
-        
+        filtered_app_names.discard("")
+
         original_count = len(sca_workspace_map)
-        
-        # Keep only mappings that match our filtered apps
+
         filtered_sca_map = {}
         for key, mapping in sca_workspace_map.items():
-            # Keep GUID-based mappings that match our filtered apps
             if key.startswith("guid:"):
-                app_guid = key[5:]  # Remove "guid:" prefix
+                app_guid = key[5:]
                 if app_guid in filtered_app_guids:
                     filtered_sca_map[key] = mapping
-            # Keep name-based mappings that match our filtered app names
             elif key.lower() in filtered_app_names:
                 filtered_sca_map[key] = mapping
-        
+
         sca_workspace_map = filtered_sca_map
         print(f"  Filtered SCA mappings: {original_count} → {len(sca_workspace_map)} (relevant to selected apps)")
         if sca_workspace_map:
             sample_keys = list(sca_workspace_map.keys())[:5]
             print(f"  Sample filtered SCA mappings: {sample_keys}")
-    
+
     print("\n" + "=" * 70)
     print("  FETCHING FINDINGS FROM APPLICATIONS")
     print("=" * 70 + "\n")
 
     all_findings = []
     apps_with_findings = 0
-    
+
     # Process applications concurrently
     with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
-        # Submit all applications for processing
         future_to_app = {}
         for idx, app in enumerate(applications, start=1):
             future = executor.submit(
@@ -1344,10 +1317,10 @@ def main():
                 sca_workspace_map=sca_workspace_map,
                 dynamic_analyses_map=dynamic_analyses_map,
                 rate_limiter=rate_limiter,
+                ca_cert=args.ca_cert,
             )
             future_to_app[future] = app
-        
-        # Collect results as they complete
+
         for future in as_completed(future_to_app):
             try:
                 findings = future.result()
@@ -1363,9 +1336,9 @@ def main():
         print("\n" + "=" * 70)
         print("  PROCESSING IAC SCAN DATA")
         print("=" * 70 + "\n")
-        
+
         iac_records = load_iac_data(args.iac_json)
-        
+
         if iac_records:
             app_map = {}
             for app in applications:
@@ -1375,33 +1348,30 @@ def main():
                     "guid": app.get("guid"),
                     "profile": app_profile
                 }
-            
+
             iac_findings_count = 0
             iac_apps_processed = 0
-            
+
             print("  Processing detailed IaC findings...\n")
-            
+
             for iac_record in iac_records:
                 asset_name = iac_record.get('asset_name', '')
-                
-                # Only exact match (case-insensitive)
+
                 matched_app = None
                 if asset_name in app_map:
                     matched_app = asset_name
                 else:
-                    # Try case-insensitive exact match
                     asset_name_lower = asset_name.lower()
                     for app_name in app_map.keys():
                         if app_name.lower() == asset_name_lower:
                             matched_app = app_name
                             break
-                
-                # If no match found, create placeholder entry for this IAC asset
+
                 if not matched_app:
-                    iac_scan_id = iac_record.get('scan_id', asset_name)  # Use scan_id if available
+                    iac_scan_id = iac_record.get('scan_id', asset_name)
                     print(f"  ⚠️  No matching application found for IaC asset '{asset_name}' - including with placeholder profile")
                     app_info = {
-                        "guid": str(iac_scan_id),  # Use IAC scan ID as GUID
+                        "guid": str(iac_scan_id),
                         "profile": {
                             "name": asset_name,
                             "business_unit": {"name": "Unknown"},
@@ -1412,16 +1382,16 @@ def main():
                 else:
                     app_info = app_map[matched_app]
                     matched_app_name = matched_app
-                
+
                 iac_apps_processed += 1
                 detailed_findings = iac_record.get('detailed_findings', [])
-                
+
                 if detailed_findings:
                     if matched_app and matched_app_name != asset_name:
                         print(f"  Processing IaC asset '{asset_name}' → matched to app '{matched_app_name}': {len(detailed_findings)} findings")
                     else:
                         print(f"  Processing {asset_name}: {len(detailed_findings)} findings")
-                
+
                 for finding in detailed_findings:
                     normalized_finding = normalize_detailed_iac_finding(
                         finding=finding,
@@ -1432,7 +1402,7 @@ def main():
                     )
                     all_findings.append(normalized_finding)
                     iac_findings_count += 1
-            
+
             print(f"\n  ✓ Processed {iac_apps_processed} applications")
             print(f"  ✓ Added {iac_findings_count} individual IaC findings\n")
         else:
@@ -1449,11 +1419,8 @@ def main():
     print(f"  Raw JSON: {json_file} ({len(all_findings)} findings)")
 
     if all_findings:
-        # Normalize findings - but skip those already normalized (IaC findings)
         normalized_findings = []
-        iac_in_list = 0
         for f in all_findings:
-            # Check if already normalized (has "Application Name" key instead of "_app_name")
             if "Application Name" in f:
                 normalized_findings.append(f)
             else:
