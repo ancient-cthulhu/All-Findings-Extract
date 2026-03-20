@@ -10,12 +10,12 @@ Export vulnerability findings from Veracode across all scan types (SAST, DAST, S
 
 1. Fetches all application profiles (paginated, supports 1000s of apps)
 2. Retrieves SCA workspace/project mappings and Dynamic Analysis metadata
-3. Processes applications concurrently — each worker thread fetches policy scan findings, SCA findings (separate API requirement), and optionally sandbox findings
+3. Processes applications concurrently - each worker thread fetches policy scan findings, SCA findings (separate API), and optionally sandbox findings
 4. Enriches findings with deep links, team names, and scan metadata
-5. Optionally merges IaC (Container Security) findings from a pre-fetched JSON file
+5. Optionally merges IaC (Container Security) findings from a pre-fetched JSON file-
 6. Writes a normalised CSV and a timestamped raw JSON file
 
-IaC scans use a browser session cookie API that is not available via standard HMAC auth. `fetch_iac_details.py` handles this separately — fetch first, then pass the JSON to `script.py` via `--iac-json`.
+IaC scans use a browser session cookie API that is not available via standard HMAC auth. `fetch_iac_details.py` handles this separately, fetch first, then pass the JSON to `script.py` via `--iac-json`.
 
 All operations are safe to re-run. Filtering, pagination, and output are deterministic.
 
@@ -26,7 +26,7 @@ All operations are safe to re-run. Filtering, pagination, and output are determi
 ### Export all findings
 
 ```bash
-export GITHUB_TOKEN="..."  # not needed for Veracode — just ensure credentials file exists
+export GITHUB_TOKEN="..."  # not needed for Veracode - just ensure credentials file exists
 
 python script.py
 ```
@@ -146,7 +146,7 @@ Cookies expire after a few hours. The script validates the cookie string is not 
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--ca-cert` | - | Path to custom CA certificate bundle (.pem). Validated at startup — produces a clear error if the file doesn't exist. Required behind SSL inspection devices (e.g. Zscaler). |
+| `--ca-cert` | - | Path to custom CA certificate bundle (.pem). Validated at startup, produces a clear error if the file doesn't exist. Required behind SSL inspection devices (e.g. Zscaler). |
 
 ### fetch_iac_details.py
 
@@ -181,7 +181,7 @@ The script validates the JSON contains detailed findings (not just summary count
 
 ## SSL Inspection (Corporate Proxy)
 
-Pass your corporate CA certificate via `--ca-cert`. The file path is validated at startup — if the file doesn't exist, you get a clear `FileNotFoundError` with conversion instructions instead of a cryptic SSL error later.
+Pass your corporate CA certificate via `--ca-cert`. The file path is validated at startup - if the file doesn't exist, you get a clear `FileNotFoundError` with conversion instructions instead of a cryptic SSL error later.
 
 If it's DER-encoded (`.cer`), convert first:
 
@@ -204,8 +204,8 @@ The script processes applications concurrently using a thread pool. All API call
 
 The rate limiter uses a token bucket algorithm. Key design choices:
 
-- **Sleeps outside the lock** — sleeping threads don't block others from acquiring tokens
-- **Uses `time.monotonic()`** — immune to NTP adjustments and wall-clock jumps
+- **Sleeps outside the lock** - sleeping threads don't block others from acquiring tokens
+- **Uses `time.monotonic()`** - immune to NTP adjustments and wall-clock jumps
 - All worker threads share a single rate limiter instance
 
 ---
@@ -277,18 +277,18 @@ IaC-specific columns are blank for non-IaC findings. Standard columns may be bla
 |-------|-----|
 | 401/403 | Check credentials file and API role (Results API for service accounts) |
 | 0 apps returned | Service accounts see all apps; user accounts only see assigned teams |
-| `SSLError: certificate verify failed` | Use `--ca-cert /path/to/corp-ca.pem` — see [SSL Inspection](#ssl-inspection-corporate-proxy) |
+| `SSLError: certificate verify failed` | Use `--ca-cert /path/to/corp-ca.pem`, see [SSL Inspection](#ssl-inspection-corporate-proxy) |
 | `FileNotFoundError: CA certificate` | The `--ca-cert` path doesn't exist; check the file path |
 | `handshake_failure` | Veracode requires TLS 1.2+; check your proxy supports it |
 | 429 Too Many Requests | Lower `--rate-limit` and `--max-workers` |
-| 404 on application | No scans yet, insufficient permissions, or app archived — script skips and continues |
-| Missing CSV fields | Expected — some fields are scan-type specific (e.g. CVE ID is SCA/IaC only) |
+| 404 on application | No scans yet, insufficient permissions, or app archived, script skips and continues |
+| Missing CSV fields | Expected, some fields are scan-type specific (e.g. CVE ID is SCA/IaC only) |
 | `--severity 9` rejected | Severity is validated to 0–5; use a valid value |
 | `--status MAYBE` rejected | Status only accepts `OPEN` or `CLOSED` |
 | IaC cookies expired | Re-export cookies from browser dev tools (expire after ~2-4 hours) |
 | IaC empty cookie error | Ensure `cookies.txt` is not empty; the script validates this at startup |
 | IaC asset not matched | Asset name in JSON doesn't match app name in Veracode exactly |
-| IaC wrong format error | Run `fetch_iac_details.py` first — the JSON must contain detailed findings |
+| IaC wrong format error | Run `fetch_iac_details.py` first - the JSON must contain detailed findings |
 
 ---
 
@@ -319,11 +319,11 @@ python script.py --max-workers 30 --rate-limit 30
 
 ## Execution Flow
 
-1. **Initialization** — validates credentials, creates HTTP sessions with connection pooling, validates `--ca-cert` path (if provided), initializes thread-safe rate limiter
-2. **Data collection** — single shared session fetches SCA workspace mappings, Dynamic Analysis metadata, and the application list; session is closed after this phase
-3. **Concurrent processing** — each worker thread gets its own session (closed in `finally`), parses scan URLs in a single pass, fetches findings, enriches with metadata
-4. **IaC integration** — loads JSON, matches assets to apps via O(1) case-insensitive lookup, normalises to common schema
-5. **Output** — writes timestamped raw JSON, normalises all findings (HTML stripped via pre-compiled regexes), writes CSV with `extrasaction="ignore"` for safe mixed-schema output
+1. **Initialization** - validates credentials, creates HTTP sessions with connection pooling, validates `--ca-cert` path (if provided), initializes thread-safe rate limiter
+2. **Data collection** - single shared session fetches SCA workspace mappings, Dynamic Analysis metadata, and the application list; session is closed after this phase
+3. **Concurrent processing** - each worker thread gets its own session (closed in `finally`), parses scan URLs in a single pass, fetches findings, enriches with metadata
+4. **IaC integration** - loads JSON, matches assets to apps via O(1) case-insensitive lookup, normalises to common schema
+5. **Output** - writes timestamped raw JSON, normalises all findings (HTML stripped via pre-compiled regexes), writes CSV with `extrasaction="ignore"` for safe mixed-schema output
 
 ---
 
