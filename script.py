@@ -22,6 +22,7 @@ from typing import Any, Optional
 
 import requests
 from veracode_api_signing.plugin_requests import RequestsAuthPluginVeracodeHMAC
+from veracode_api_py.apihelper import APIHelper
 
 
 # ---------------------------------------------------------------------------
@@ -40,6 +41,13 @@ DEFAULT_PAGE_SIZE = 1000
 MAX_CONSECUTIVE_ERRORS = 3
 NON_SCA_SCAN_TYPES = ("STATIC", "DYNAMIC", "MANUAL")
 MAX_ERROR_BODY_LOG = 500
+
+# IaC / Container Security API (uses principal token auth, not HMAC)
+IAC_API_BASE = "https://ui.analysiscenter.veracode.com/container-scan-query/v1"
+IAC_SCANS_URL = f"{IAC_API_BASE}/scans"
+IAC_FINDINGS_URL_TEMPLATE = f"{IAC_API_BASE}/scans/{{scan_id}}/findings"
+IAC_AUTH_TOKEN_PREFIX = "VERACODE-TOKEN vsid="
+IAC_MAX_RECORDS = 9999
 
 # Pre-compiled regexes for the hot-path in strip_html_tags
 _RE_HTML_TAG = re.compile(r"<[^>]+>")
@@ -91,13 +99,31 @@ CSV_FIELDNAMES: list[str] = [
     "IAC End Line",
 ]
 
+# All valid values for --scan-type (used for CLI validation and routing)
+VALID_SCAN_TYPES = frozenset({"STATIC", "DYNAMIC", "MANUAL", "SCA", "IAC"})
+# Scan types handled by the Findings REST API (IAC uses a separate API)
+API_SCAN_TYPES = frozenset({"STATIC", "DYNAMIC", "MANUAL", "SCA"})
+
+
+def _parse_requested_scan_types(scan_type_str: Optional[str]) -> list[str]:
+    """Parse a comma-separated scan-type string into an uppercase list."""
+    if not scan_type_str:
+        return []
+    return [s.strip().upper() for s in scan_type_str.split(",") if s.strip()]
+
 
 # ---------------------------------------------------------------------------
 # Session Factory
 # ---------------------------------------------------------------------------
 
-def create_session(ca_cert: Optional[str] = None) -> requests.Session:
+def create_session(ca_cert: Optional[str] = None, use_hmac: bool = True) -> requests.Session:
     """Create an HTTP session with connection pooling and optional custom CA cert.
+
+    Args:
+        ca_cert: Path to a custom CA certificate bundle (.pem).
+        use_hmac: If True, attach Veracode HMAC auth to the session so all
+            requests are signed automatically. Set False for sessions that
+            use token-based auth (IaC/Container Security).
 
     Raises:
         FileNotFoundError: If *ca_cert* is provided but the file does not exist.
@@ -121,6 +147,8 @@ def create_session(ca_cert: Optional[str] = None) -> requests.Session:
 
     if ca_cert:
         session.verify = ca_cert
+    if use_hmac:
+        session.auth = RequestsAuthPluginVeracodeHMAC()
     return session
 
 
@@ -245,9 +273,11 @@ def _extract_cve_id(details: dict[str, Any]) -> Optional[str]:
 def _extract_cvss(details: dict[str, Any]) -> Optional[float]:
     cve = details.get("cve")
     if isinstance(cve, dict):
-        cvss3 = cve.get("cvss3") or {}
-        if cvss3.get("score"):
-            return cvss3["score"]
+        cvss3 = cve.get("cvss3")
+        if isinstance(cvss3, dict):
+            score = cvss3.get("score")
+            if score is not None:
+                return score
         return cve.get("cvss")
     return details.get("cvss")
 
@@ -578,7 +608,6 @@ def get_applications(
             resp = session.get(
                 APPLICATIONS_URL,
                 params={"page": page, "size": 1000},
-                auth=RequestsAuthPluginVeracodeHMAC(),
                 timeout=45,
             )
 
@@ -631,7 +660,7 @@ def get_sandboxes(
     try:
         if rate_limiter:
             rate_limiter.acquire()
-        resp = session.get(url, auth=RequestsAuthPluginVeracodeHMAC(), timeout=60)
+        resp = session.get(url, timeout=60)
         if resp.status_code == 404:
             return []
         if resp.status_code != 200:
@@ -660,7 +689,7 @@ def get_sca_workspaces(
             resp = session.get(
                 f"{SCA_API_BASE}/workspaces",
                 params={"page": page, "size": 500},
-                auth=RequestsAuthPluginVeracodeHMAC(), timeout=60,
+                timeout=60,
             )
             if resp.status_code != 200:
                 break
@@ -690,7 +719,7 @@ def get_sca_workspaces(
                 resp = session.get(
                     f"{SCA_API_BASE}/workspaces/{ws_id}/projects",
                     params={"page": pp, "size": 500},
-                    auth=RequestsAuthPluginVeracodeHMAC(), timeout=60,
+                    timeout=60,
                 )
                 if resp.status_code != 200:
                     break
@@ -732,7 +761,7 @@ def get_dynamic_analyses(
             rate_limiter.acquire()
         resp = session.get(
             DYNAMIC_ANALYSES_URL, params={"size": 500},
-            auth=RequestsAuthPluginVeracodeHMAC(), timeout=60,
+            timeout=60,
         )
         if resp.status_code != 200:
             return da_map
@@ -745,7 +774,7 @@ def get_dynamic_analyses(
                 rate_limiter.acquire()
             sr = session.get(
                 f"{DYNAMIC_ANALYSES_URL}/{a_id}/scans",
-                auth=RequestsAuthPluginVeracodeHMAC(), timeout=60,
+                timeout=60,
             )
             if sr.status_code == 200:
                 for scan in _get_embedded(sr.json(), "scans"):
@@ -811,7 +840,7 @@ def _fetch_findings_page(
 
             resp = session.get(
                 url, params=params,
-                auth=RequestsAuthPluginVeracodeHMAC(), timeout=120,
+                timeout=120,
             )
             if resp.status_code == 404:
                 print(f"    No findings or app not found (404) [{label}]")
@@ -870,10 +899,7 @@ def _get_all_findings_for_app(
     """Fetch findings for policy scan (+ sandboxes).  SCA fetched separately per API rules."""
     all_findings: list[dict] = []
 
-    requested = (
-        [s.strip().upper() for s in filters["scan_type"].split(",") if s.strip()]
-        if filters.get("scan_type") else []
-    )
+    requested = _parse_requested_scan_types(filters.get("scan_type"))
     if requested:
         fetch_sca = "SCA" in requested
         non_sca = [t for t in requested if t in NON_SCA_SCAN_TYPES]
@@ -1009,36 +1035,245 @@ def _process_application(
 
 
 # ---------------------------------------------------------------------------
-# IaC Data Loading
+# IaC Live Fetching (principal token auth)
 # ---------------------------------------------------------------------------
 
-def _load_iac_data(path: str) -> list[dict[str, Any]]:
-    """Load and validate IaC detailed findings from a JSON file."""
+def _get_principal_token() -> str:
+    """Get a session token via HMAC-authenticated principal API call.
+
+    This replaces the browser-cookie requirement for IaC/Container Security
+    endpoints by using the same HMAC credentials already configured for the
+    other Veracode REST APIs.
+
+    Note: Depends on APIHelper._rest_request (private method). Pin the
+    veracode-api-py version in requirements to avoid breakage on upgrades.
+
+    Raises:
+        RuntimeError: If the token cannot be retrieved.
+    """
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except FileNotFoundError:
-        print(f"✗ ERROR: IaC JSON file not found: {path}")
-        return []
-    except json.JSONDecodeError as exc:
-        print(f"✗ ERROR: Invalid JSON in IaC file: {exc}")
-        return []
+        principal = APIHelper()._rest_request("api/authn/v2/principal", "GET")
     except Exception as exc:
-        print(f"✗ ERROR loading IaC data: {exc}")
+        raise RuntimeError(f"Failed to retrieve principal token: {exc}") from exc
+
+    if not isinstance(principal, dict) or "token" not in principal:
+        raise RuntimeError(
+            f"Unexpected principal response type: {type(principal).__name__}"
+        )
+    return principal["token"]
+
+
+def _iac_auth_header(token: str) -> dict[str, str]:
+    """Build the Authorization header for IaC/Container Security API calls."""
+    return {"Authorization": f"{IAC_AUTH_TOKEN_PREFIX}{token}"}
+
+
+def _fetch_iac_scans(
+    session: requests.Session,
+    token: str,
+    rate_limiter: Optional[RateLimiter] = None,
+    filter_apps: Optional[set[str]] = None,
+) -> list[dict[str, Any]]:
+    """Fetch the IaC scan list using principal token auth.
+
+    Returns a list of scan records, optionally filtered by app/asset name.
+    """
+    all_records: list[dict] = []
+    page = 0
+
+    print("  Fetching IaC scan list...")
+
+    while True:
+        params = {"page": page, "limit": IAC_MAX_RECORDS}
+        try:
+            if rate_limiter:
+                rate_limiter.acquire()
+
+            resp = session.get(
+                IAC_SCANS_URL,
+                headers=_iac_auth_header(token),
+                params=params,
+                timeout=30,
+            )
+
+            if resp.status_code == 401:
+                print("  ✗ IaC authentication failed. Check API credentials and roles.")
+                return []
+            if resp.status_code != 200:
+                print(f"  ✗ Error fetching IaC scans: HTTP {resp.status_code}")
+                return []
+
+            data = resp.json()
+            records = data.get("records", [])
+            if not records:
+                break
+
+            all_records.extend(records)
+            print(f"    Page {page}: {len(records)} scans (Total: {len(all_records)})")
+
+            total_pages = data.get("pagination", {}).get("total_pages", 1)
+            if page >= total_pages - 1:
+                break
+            page += 1
+
+        except Exception as exc:
+            print(f"  ✗ Exception fetching IaC scans: {exc}")
+            return all_records
+
+    if filter_apps:
+        filter_lc = {n.lower() for n in filter_apps}
+        all_records = [
+            r for r in all_records
+            if r.get("asset_name", "").lower() in filter_lc
+        ]
+        print(f"  Filtered to {len(all_records)} scans matching specified apps")
+
+    print(f"  ✓ Found {len(all_records)} IaC scans\n")
+    return all_records
+
+
+def _fetch_iac_scan_findings(
+    session: requests.Session,
+    token: str,
+    scan_id: int,
+    rate_limiter: Optional[RateLimiter] = None,
+) -> list[dict[str, Any]]:
+    """Fetch all findings for a single IaC scan ID."""
+    url = IAC_FINDINGS_URL_TEMPLATE.format(scan_id=scan_id)
+    all_findings: list[dict] = []
+    page = 0
+
+    while True:
+        params = {
+            "page": page,
+            "limit": IAC_MAX_RECORDS,
+            "sort": "severity",
+            "direction": "desc",
+        }
+        try:
+            if rate_limiter:
+                rate_limiter.acquire()
+
+            resp = session.get(
+                url,
+                headers=_iac_auth_header(token),
+                params=params,
+                timeout=30,
+            )
+            if resp.status_code == 401 or resp.status_code != 200:
+                return all_findings
+
+            data = resp.json()
+            findings = data.get("findings", [])
+            if not findings:
+                break
+
+            all_findings.extend(findings)
+
+            total_pages = data.get("pagination", {}).get("total_pages", 1)
+            if page >= total_pages - 1:
+                break
+            page += 1
+
+        except Exception as exc:
+            print(f"    WARNING: Error fetching IaC findings for scan {scan_id} "
+                  f"page {page}: {exc}")
+            return all_findings
+
+    return all_findings
+
+
+def _process_iac_scan(
+    record: dict[str, Any],
+    idx: int,
+    total: int,
+    token: str,
+    rate_limiter: Optional[RateLimiter] = None,
+    ca_cert: Optional[str] = None,
+) -> dict[str, Any]:
+    """Fetch detailed findings for one IaC scan (thread worker).
+
+    Creates its own session and closes it in a finally block.
+    """
+    asset_name = record.get("asset_name", "Unknown")
+    scan_id = record.get("scan_id")
+
+    if not scan_id:
+        print(f"    [{idx}/{total}] {asset_name}: ✗ No scan_id")
+        return record
+
+    print(f"    [{idx}/{total}] {asset_name} (Scan {scan_id})...")
+
+    session = create_session(ca_cert=ca_cert, use_hmac=False)
+    try:
+        findings = _fetch_iac_scan_findings(session, token, scan_id, rate_limiter)
+    finally:
+        session.close()
+
+    detailed_record = record.copy()
+    detailed_record["detailed_findings"] = findings
+
+    if findings:
+        print(f"      ✓ {len(findings)} findings")
+    else:
+        print("      No findings")
+
+    return detailed_record
+
+
+def _fetch_iac_data_live(
+    rate_limiter: RateLimiter,
+    max_workers: int = 10,
+    filter_apps: Optional[set[str]] = None,
+    ca_cert: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Fetch IaC scan data live via principal token auth.
+
+    Returns a list of scan records with detailed_findings populated.
+    """
+    # Step 1: Get principal token
+    print("  Obtaining principal token via HMAC auth...")
+    try:
+        token = _get_principal_token()
+        print("  ✓ Principal token obtained\n")
+    except RuntimeError as exc:
+        print(f"  ✗ {exc}")
         return []
 
-    print(f"✓ Loaded IaC data from {path}")
-    records = data.get("records", [])
+    # Step 2: Fetch scan list
+    session = create_session(ca_cert=ca_cert, use_hmac=False)
+    try:
+        records = _fetch_iac_scans(session, token, rate_limiter, filter_apps)
+    finally:
+        session.close()
+
     if not records:
-        print("  ✗ No IaC records found in file")
         return []
-    if "detailed_findings" not in records[0]:
-        print("  ✗ ERROR: File does not contain detailed findings.")
-        print("  Please use fetch_iac_details.py to fetch detailed findings.")
-        return []
-    total = sum(len(r.get("detailed_findings", [])) for r in records)
-    print(f"  Found {len(records)} IaC scans with {total} total findings")
-    return records
+
+    # Step 3: Fetch detailed findings concurrently
+    print(f"  Fetching detailed findings for {len(records)} scans...\n")
+    detailed_records: list[dict] = []
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_record = {
+            executor.submit(
+                _process_iac_scan,
+                record=rec, idx=idx, total=len(records),
+                token=token, rate_limiter=rate_limiter,
+                ca_cert=ca_cert,
+            ): rec
+            for idx, rec in enumerate(records, 1)
+        }
+        for future in as_completed(future_to_record):
+            try:
+                detailed_records.append(future.result())
+            except Exception as exc:
+                rec = future_to_record[future]
+                print(f"    ✗ ERROR processing {rec.get('asset_name', 'Unknown')}: {exc}")
+
+    total_findings = sum(len(r.get("detailed_findings", [])) for r in detailed_records)
+    print(f"\n  ✓ Fetched {len(detailed_records)} IaC scans with {total_findings} total findings")
+    return detailed_records
 
 
 # ---------------------------------------------------------------------------
@@ -1056,7 +1291,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--app-guid",
                    help="Specific application GUID to process.")
     p.add_argument("--scan-type",
-                   help="Comma-separated scan types: STATIC, DYNAMIC, MANUAL, SCA.")
+                   help="Comma-separated scan types: STATIC, DYNAMIC, MANUAL, SCA, IAC.")
     p.add_argument("--severity", type=int, choices=range(6), metavar="0-5",
                    help="Exact severity filter (0-5).")
     p.add_argument("--severity-gte", type=int, choices=range(6), metavar="0-5",
@@ -1075,8 +1310,6 @@ def _parse_args() -> argparse.Namespace:
                    help="Max API requests/second (default: 10).")
     p.add_argument("--max-apps", type=int,
                    help="Limit apps processed (testing).")
-    p.add_argument("--iac-json",
-                   help="Path to IaC detailed-findings JSON file.")
     p.add_argument("--ca-cert",
                    help="Path to custom CA certificate bundle (.pem).")
     return p.parse_args()
@@ -1103,6 +1336,21 @@ def main() -> None:
     if args.status:
         filters["status"] = args.status
 
+    # --- Scan-type routing ---
+    requested_types = _parse_requested_scan_types(args.scan_type)
+    if requested_types:
+        unknown = set(requested_types) - VALID_SCAN_TYPES
+        if unknown:
+            print(f"ERROR: Invalid scan type(s): {', '.join(sorted(unknown))}")
+            print(f"  Valid values: {', '.join(sorted(VALID_SCAN_TYPES))}")
+            return
+
+    # Determine which phases to run based on requested scan types
+    fetch_api_findings = not requested_types or bool(
+        set(requested_types) & API_SCAN_TYPES
+    )
+    fetch_iac = not requested_types or "IAC" in requested_types
+
     # --- Banner ---
     print("\n" + "=" * 70)
     print("  VERACODE FINDINGS API EXPORT")
@@ -1124,31 +1372,36 @@ def main() -> None:
         print(f"  Filter Sev >=    : {args.severity_gte}")
     print("=" * 70 + "\n")
 
-    # --- Phase 1: Pre-fetch lookup data (single shared session) ---
+    # --- Phase 1: Pre-fetch lookup data (only when API findings are needed) ---
+    sca_map: dict[str, dict[str, str]] = {}
+    da_map: dict[str, list[dict[str, Any]]] = {}
+    applications: list[dict[str, Any]] = []
+
     session = create_session(ca_cert=args.ca_cert)
     try:
-        print("\n" + "=" * 70)
-        print("  FETCHING SCA WORKSPACE MAPPINGS")
-        print("=" * 70)
-        sca_map = get_sca_workspaces(session, args.sleep, rate_limiter)
-        if sca_map:
-            print(f"  Found {len(sca_map)} SCA project mappings")
-        else:
-            print("  No SCA projects found or unable to fetch")
-        print("=" * 70 + "\n")
+        if fetch_api_findings:
+            print("\n" + "=" * 70)
+            print("  FETCHING SCA WORKSPACE MAPPINGS")
+            print("=" * 70)
+            sca_map = get_sca_workspaces(session, args.sleep, rate_limiter)
+            if sca_map:
+                print(f"  Found {len(sca_map)} SCA project mappings")
+            else:
+                print("  No SCA projects found or unable to fetch")
+            print("=" * 70 + "\n")
 
-        print("\n" + "=" * 70)
-        print("  FETCHING DYNAMIC ANALYSIS MAPPINGS")
-        print("=" * 70)
-        da_map = get_dynamic_analyses(session, args.sleep, rate_limiter)
-        if da_map:
-            total_da = sum(len(v) for v in da_map.values())
-            print(f"  Found {total_da} Dynamic Analysis across {len(da_map)} applications")
-        else:
-            print("  No Dynamic Analysis found or unable to fetch")
-        print("=" * 70 + "\n")
+            print("\n" + "=" * 70)
+            print("  FETCHING DYNAMIC ANALYSIS MAPPINGS")
+            print("=" * 70)
+            da_map = get_dynamic_analyses(session, args.sleep, rate_limiter)
+            if da_map:
+                total_da = sum(len(v) for v in da_map.values())
+                print(f"  Found {total_da} Dynamic Analysis across {len(da_map)} applications")
+            else:
+                print("  No Dynamic Analysis found or unable to fetch")
+            print("=" * 70 + "\n")
 
-        # --- Phase 2: Resolve application list ---
+        # --- Phase 2: Resolve application list (always needed for IaC matching) ---
         if args.app_guid:
             applications = [{"guid": args.app_guid, "profile": {"name": "Unknown"}}]
             print(f"Processing single application: {args.app_guid}\n")
@@ -1177,51 +1430,63 @@ def main() -> None:
         app_names_lc = {a.get("profile", {}).get("name", "").lower() for a in applications}
         app_names_lc.discard("")
         orig = len(sca_map)
-        # SCA map keys are already lowercase (project names) or "guid:" prefixed
         sca_map = {
             k: v for k, v in sca_map.items()
             if (k.startswith("guid:") and k[5:] in app_guids)
             or (not k.startswith("guid:") and k in app_names_lc)
         }
-        print(f"  Filtered SCA mappings: {orig} → {len(sca_map)} (relevant to selected apps)")
+        print(f"  Filtered SCA mappings: {orig} -> {len(sca_map)} (relevant to selected apps)")
 
-    # --- Phase 3: Fetch findings concurrently ---
-    print("\n" + "=" * 70)
-    print("  FETCHING FINDINGS FROM APPLICATIONS")
-    print("=" * 70 + "\n")
-
+    # --- Phase 3: Fetch findings concurrently (skip if only IAC requested) ---
     all_findings: list[dict] = []
     apps_with_findings = 0
 
-    with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
-        future_to_app = {
-            executor.submit(
-                _process_application,
-                app=app, idx=idx, total=len(applications),
-                filters=filters, sleep_time=args.sleep,
-                include_sandboxes=args.include_sandbox,
-                sca_map=sca_map, da_map=da_map,
-                rate_limiter=rate_limiter, ca_cert=args.ca_cert,
-            ): app
-            for idx, app in enumerate(applications, 1)
-        }
-        for future in as_completed(future_to_app):
-            try:
-                findings = future.result()
-                if findings:
-                    all_findings.extend(findings)
-                    apps_with_findings += 1
-            except Exception as exc:
-                name = future_to_app[future].get("profile", {}).get("name", "Unknown")
-                print(f"    ✗ ERROR processing {name}: {exc}\n")
-
-    # --- Phase 4: IaC integration ---
-    if args.iac_json:
+    if fetch_api_findings:
         print("\n" + "=" * 70)
-        print("  PROCESSING IAC SCAN DATA")
+        print("  FETCHING FINDINGS FROM APPLICATIONS")
         print("=" * 70 + "\n")
 
-        iac_records = _load_iac_data(args.iac_json)
+        with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
+            future_to_app = {
+                executor.submit(
+                    _process_application,
+                    app=app, idx=idx, total=len(applications),
+                    filters=filters, sleep_time=args.sleep,
+                    include_sandboxes=args.include_sandbox,
+                    sca_map=sca_map, da_map=da_map,
+                    rate_limiter=rate_limiter, ca_cert=args.ca_cert,
+                ): app
+                for idx, app in enumerate(applications, 1)
+            }
+            for future in as_completed(future_to_app):
+                try:
+                    findings = future.result()
+                    if findings:
+                        all_findings.extend(findings)
+                        apps_with_findings += 1
+                except Exception as exc:
+                    name = future_to_app[future].get("profile", {}).get("name", "Unknown")
+                    print(f"    ✗ ERROR processing {name}: {exc}\n")
+    else:
+        print("\n  Skipping API findings fetch (--scan-type does not include API scan types)\n")
+
+    # --- Phase 4: IaC integration ---
+    if fetch_iac:
+        print("\n" + "=" * 70)
+        print("  FETCHING IAC SCAN DATA")
+        print("=" * 70 + "\n")
+
+        iac_filter_set: Optional[set[str]] = None
+        if args.app_name:
+            iac_filter_set = {n.strip() for n in args.app_name.split(",") if n.strip()}
+
+        iac_records = _fetch_iac_data_live(
+            rate_limiter=rate_limiter,
+            max_workers=args.max_workers,
+            filter_apps=iac_filter_set,
+            ca_cert=args.ca_cert,
+        )
+
         if iac_records:
             # Build exact + case-insensitive lookups (O(1) matching)
             app_by_name: dict[str, dict] = {}
@@ -1248,7 +1513,7 @@ def main() -> None:
                     matched_name = info["profile"].get("name", asset)
                 else:
                     sid = rec.get("scan_id", asset)
-                    print(f"  ⚠️  No matching app for IaC asset '{asset}' — using placeholder")
+                    print(f"  Warning: No matching app for IaC asset '{asset}' - using placeholder")
                     info = {
                         "guid": str(sid),
                         "profile": {"name": asset, "business_unit": {"name": "Unknown"}, "teams": []},
@@ -1269,7 +1534,7 @@ def main() -> None:
             print(f"\n  ✓ Processed {iac_apps} IaC applications")
             print(f"  ✓ Added {iac_count} individual IaC findings\n")
         else:
-            print("  ✗ No IaC records to process\n")
+            print("  No IaC scan data found, skipping.\n")
 
     # --- Phase 5: Write outputs ---
     print("\n" + "=" * 70)
@@ -1302,8 +1567,8 @@ def main() -> None:
     print(f"  Applications processed    : {len(applications)}")
     print(f"  Applications with findings: {apps_with_findings}")
     print(f"  Total findings            : {len(all_findings)}")
-    if args.iac_json:
-        iac_n = sum(1 for r in all_findings if isinstance(r, dict) and r.get("Scan Type") == "IAC")
+    iac_n = sum(1 for r in all_findings if isinstance(r, dict) and r.get("Scan Type") == "IAC")
+    if iac_n:
         print(f"    - Regular scan findings : {len(all_findings) - iac_n}")
         print(f"    - IaC scan findings     : {iac_n}")
     print("=" * 70 + "\n")
