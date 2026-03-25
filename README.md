@@ -73,11 +73,10 @@ python script.py --include-iac --cookies-file cookies.txt
 |`--cwe`            |None    |CWE ID (single or comma-separated)                                  |
 |`--status`         |None    |OPEN or CLOSED                                                      |
 |`--include-sandbox`|False   |Include sandbox findings                                            |
-|`--include-iac`    |False   |Include IaC (Container Security) findings                           |
-|`--cookies-file`   |None    |Path to browser cookies file (required for IaC)                     |
 |`--max-workers`    |10      |Concurrent threads for parallel processing                          |
 |`--rate-limit`     |10.0    |Max API requests/second                                             |
 |`--max-apps`       |None    |Limit apps processed (testing)                                      |
+| `--ca-cert` | - | Path to custom CA certificate bundle (.pem). Validated at startup, produces a clear error if the file doesn't exist. Required behind SSL inspection devices (e.g. Zscaler). |
 
 ## IaC (Container Security) Integration
 
