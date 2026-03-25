@@ -26,8 +26,6 @@ All operations are safe to re-run. Filtering, pagination, and output are determi
 ### Export all findings
 
 ```bash
-export GITHUB_TOKEN="..."  # not needed for Veracode - just ensure credentials file exists
-
 python script.py
 ```
 
