@@ -219,7 +219,7 @@ python script.py --max-workers 30 --rate-limit 30
 
 4. **Finding Extraction (Per Application)**
    - Fetches policy scan findings (all scan types except SCA)
-   - Fetches SCA findings separately (API requirement)
+   - Fetches SCA findings separately
    - If `--include-sandbox`: iterates through all sandboxes and repeats above
    - Enriches findings with application metadata and deep links
    - Maps SCA Agent findings to workspace/project IDs
@@ -283,12 +283,6 @@ python script.py --max-workers 30 --rate-limit 30
   - Days to Resolve: Only when Fixed Date is available
   - CVSS: Primarily SCA findings
 - This is expected behavior, not an error
-
-**IaC cookies expired** 
-- Browser session cookies typically expire after 2-4 hours
-- Get fresh cookies by logging into Veracode Platform again
-- Copy new Cookie header value from browser Developer Tools
-- Update `cookies.txt` file
 
 **IaC applications not matched**
 - IaC matching uses fuzzy logic to match asset names to application names
