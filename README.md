@@ -64,10 +64,10 @@ python script.py --include-iac --cookies-file cookies.txt
 
 |Argument           |Default |Description                                                         |
 |-------------------|--------|--------------------------------------------------------------------|
-|`--output`         |`veracode_findings_api.csv`|Output CSV filename                          |
+|`--output`         |`veracode_findings_api.csv`|Output CSV filename                              |
 |`--app-name`       |None    |Comma-separated application names (exact match)                     |
 |`--app-guid`       |None    |Specific application GUID                                           |
-|`--scan-type`      |None    |STATIC, DYNAMIC, MANUAL, SCA (comma-separated)                      |
+|`--scan-type`      |None    |STATIC, DYNAMIC, MANUAL, SCA, IAC (comma-separated)                 |
 |`--severity`       |None    |Exact severity (0–5)                                                |
 |`--severity-gte`   |None    |Severity >= (0–5)                                                   |
 |`--cwe`            |None    |CWE ID (single or comma-separated)                                  |
